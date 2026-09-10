@@ -333,6 +333,38 @@ jobs:
 
           echo "✅ Published @ant-yasa/uast-parser-php@$VERSION"
 
+  # Python now also provides the same npm API as PHP. Keep legacy binaries
+  # during the Engine migration so existing consumers continue to work.
+  publish_parser_python:
+    needs: [publish_spec, get_version]
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      VERSION: ${{ needs.get_version.outputs.version }}
+      NPM_TAG: ${{ needs.get_version.outputs.npm_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+      - name: Publish Python npm parser
+        working-directory: parser-Python
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          npm install -g npm@11.6.4
+          if npm view "@ant-yasa/uast-parser-python@$VERSION" version > /dev/null 2>&1; then
+            exit 0
+          fi
+          npm ci --ignore-scripts
+          npm install "@ant-yasa/uast-spec@$VERSION" --ignore-scripts
+          npm version "$VERSION" --no-git-tag-version
+          npm run build
+          npm test
+          npm pack --dry-run
+          npm publish --tag "$NPM_TAG" --access public
+
   # 4. 构建 Go 可执行文件（多平台）
   build_go:
     needs: publish_parser_js
