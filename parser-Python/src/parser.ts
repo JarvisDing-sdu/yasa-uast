@@ -1,25 +1,30 @@
-import { Parser as TreeParser, Language, type Node as SyntaxNode } from 'web-tree-sitter';
+import * as TreeSitter from 'web-tree-sitter';
 import type * as UAST from '@ant-yasa/uast-spec';
 import { dirname, join } from 'node:path';
 import { Visitor } from './visitor';
+
+type SyntaxNode = TreeSitter.Node;
 
 export interface ParseOptions {
     sourcefile?: string;
 }
 
-let parser: TreeParser | undefined;
+let parser: TreeSitter.Parser | undefined;
 let initializing: Promise<void> | undefined;
 
 export function init(): Promise<void> {
     if (parser) return Promise.resolve();
     if (!initializing) {
         initializing = (async () => {
-            await TreeParser.init();
-            // Resolve the package, then join the asset filename: pkg must not
-            // classify a literal require.resolve('*.wasm') as JavaScript.
+            await TreeSitter.Parser.init();
+            // Resolve the package directory first. pkg treats a literal
+            // require.resolve('*.wasm') as a script and may corrupt the WASM
+            // bytes during bytecode packaging.
             const grammarRoot = dirname(require.resolve('tree-sitter-python/package.json'));
-            const language = await Language.load(join(grammarRoot, 'tree-sitter-python.wasm'));
-            const instance = new TreeParser();
+            const language = await TreeSitter.Language.load(
+                join(grammarRoot, 'tree-sitter-python.wasm')
+            );
+            const instance = new TreeSitter.Parser();
             instance.setLanguage(language);
             parser = instance;
         })().catch((error) => {
