@@ -78,6 +78,48 @@ export function parse(content: string, opts: ParseOptions = {}): UAST.Node {
             }
         }
         if (tree.rootNode.hasError) {
+            // tree-sitter-python 0.25 rejects starred items in bare tuples.
+            // Retry only token-level stars after a tuple delimiter; a same-width
+            // unary placeholder preserves every source location. Accept it only
+            // when the resulting node is a direct item of an expression_list.
+            const stars = new Set<number>();
+            let previous = '';
+            const collect = (node: SyntaxNode) => {
+                if (node.type.endsWith('splat_pattern')) { previous = 'pattern'; return; }
+                if (['string', 'comment'].includes(node.type)) {
+                    if (node.type === 'string') previous = 'string';
+                    return;
+                }
+                if (node.children.length) node.children.forEach(collect);
+                else {
+                    if (node.type === '*' && content[node.startIndex - 1] !== '*' &&
+                        content[node.endIndex] !== '*' && [',', '=', 'return', 'yield'].includes(previous))
+                        stars.add(node.startIndex);
+                    previous = node.type;
+                }
+            };
+            collect(tree.rootNode);
+            if (stars.size) {
+                const input = content.slice(0, tree.rootNode.startIndex) + tree.rootNode.text +
+                    content.slice(tree.rootNode.endIndex);
+                const compatible = input.split('').map((ch, i) => stars.has(i) ? '+' : ch).join('');
+                const retry = parser.parse(compatible);
+                if (retry) {
+                    const unmatched = new Set(stars);
+                    const validate = (node: SyntaxNode) => {
+                        if (stars.has(node.startIndex) && node.parent?.type === 'expression_list')
+                            unmatched.delete(node.startIndex);
+                        node.namedChildren.forEach(validate);
+                    };
+                    validate(retry.rootNode);
+                    if (!retry.rootNode.hasError && unmatched.size === 0) {
+                        tree.delete();
+                        tree = retry;
+                    } else retry.delete();
+                }
+            }
+        }
+        if (tree.rootNode.hasError) {
             const node = syntaxError(tree.rootNode);
             throw new SyntaxError(
                 `${opts.sourcefile || '<python>'}:${node.startPosition.row + 1}:${node.startPosition.column + 1}: invalid Python syntax (${node.type})`

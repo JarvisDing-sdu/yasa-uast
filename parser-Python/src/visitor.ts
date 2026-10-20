@@ -419,7 +419,10 @@ export class Visitor {
         return result;
     }
 
-    visit(n: SyntaxNode | null): any {
+    visit(n: SyntaxNode | null, restoredSplat = false): any {
+        if (n && !restoredSplat && n.parent?.type === 'expression_list' &&
+            this.text(n).startsWith('*') && n.type !== 'list_splat')
+            return this.make('DereferenceExpression', n, { argument: this.visit(n, true) });
         if (!n) return null;
         const c = this.children(n);
         const f = (name: string) => this.field(n, name);
@@ -545,6 +548,11 @@ export class Visitor {
             }
             case 'not_operator':
             case 'unary_operator':
+                // The bare-tuple compatibility parser uses a unary placeholder.
+                // Its enclosing tuple item restores the splat around the whole
+                // expression (e.g. *[None] * 3), not just the unary operand.
+                if (n.type === 'unary_operator' && this.text(n).startsWith('*'))
+                    return v('argument');
                 return this.make('UnaryExpression', n, {
                     operator: operators[f('operator')?.text || 'not'] || f('operator')?.text,
                     argument: v('argument'),

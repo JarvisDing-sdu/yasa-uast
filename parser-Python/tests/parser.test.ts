@@ -12,6 +12,29 @@ before(async () => {
 });
 const body = (code: string): any[] => (parser.parse(code) as any).body;
 
+test('bare starred tuples preserve expressions and match parenthesized tuples', () => {
+    const normalize = (value: any): any => {
+        if (Array.isArray(value)) return value.map(normalize);
+        if (value && typeof value === 'object') return Object.fromEntries(
+            Object.entries(value).filter(([key]) => !['loc', 'sourcefile'].includes(key))
+                .map(([key, item]) => [key, normalize(item)]));
+        return value;
+    };
+    for (const [prefix, expression] of [
+        ['def f():\n return ', 'None, *(g(x) for x in xs)'],
+        ['def f():\n return ', '*[None] * 3, *g_xs, *[None] * num_additional_inputs'],
+        ['def f():\n return ', 'dx, dw, db, dresidual, *([None] * 5)'],
+        ['host, *rest = ', 'endpoint, *[]'],
+        ['名字 = ', 'x, *values'],
+    ]) {
+        assert.deepEqual(normalize(parser.parse(prefix + expression)),
+            normalize(parser.parse(prefix + '(' + expression + ')')));
+    }
+    for (const source of ['x = a, **values', 'x = a, *', 'x = a, *values +'])
+        assert.throws(() => parser.parse(source), SyntaxError);
+    assert.equal(body('x = 2 * 3')[0].right.operator, '*');
+});
+
 test('normalizes UTF-8 BOM and explicitly rejects unsupported string semantics', () => {
     assert.deepEqual(parser.parse('\uFEFFx = 1'), parser.parse('x = 1'));
     for (const source of [String.raw`x = "\N{SNOWMAN}"`, 'x = t"hello"'])
