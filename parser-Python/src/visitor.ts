@@ -38,6 +38,10 @@ const operators: Record<string, string> = {
 
 export class Visitor {
     private temporary = 0;
+    // Marks only the synthetic `+` nodes used to join f-string parts. A plain
+    // BinaryExpression inside an interpolation (for example `{len(x) + 1}`)
+    // must never be flattened as though it were part of the surrounding text.
+    private readonly fStringJoins = new WeakSet<object>();
     private readonly lines: string[];
     constructor(
         private readonly source: string,
@@ -444,6 +448,21 @@ export class Visitor {
             case 'float': {
                 const text = n.text.replaceAll('_', '');
                 if (/[jJ]$/.test(text)) return this.literal('...', null, n);
+                // Python integers are arbitrary precision, while JavaScript
+                // Number silently rounds above Number.MAX_SAFE_INTEGER. Keep
+                // an unsafe integer token as text; literalType='number'
+                // preserves its Python/UAST meaning and downstream emitters
+                // can reproduce the exact token.
+                if (n.type === 'integer') {
+                    try {
+                        const integer = BigInt(text);
+                        if (integer > BigInt(Number.MAX_SAFE_INTEGER) || integer < BigInt(Number.MIN_SAFE_INTEGER)) {
+                            return this.literal(text, 'number', n);
+                        }
+                    } catch {
+                        // Fall through to the existing finite-number handling.
+                    }
+                }
                 const value = Number(text);
                 return this.literal(
                     Number.isFinite(value) ? value : 'inf',
@@ -466,15 +485,38 @@ export class Visitor {
                     .map((child) => this.string(child))
                     .filter((part): part is Node => part !== null);
                 if (!parts.length) return null;
-                if (parts.every((p) => p.type === 'Literal'))
+                // CPython folds adjacent constant f-string pieces before the
+                // legacy visitor sees them. Flatten the local '+' trees and
+                // merge only adjacent string literals to retain that UAST
+                // shape without changing interpolation order.
+                const flatten = (part: any): Node[] =>
+                    part?.type === 'BinaryExpression' &&
+                    part.operator === '+' &&
+                    this.fStringJoins.has(part)
+                        ? [...flatten(part.left), ...flatten(part.right)]
+                        : [part];
+                const merged: Node[] = [];
+                for (const part of parts.flatMap(flatten)) {
+                    const previous: any = merged.at(-1);
+                    if (
+                        previous?.type === 'Literal' &&
+                        previous.literalType === 'string' &&
+                        part?.type === 'Literal' &&
+                        part.literalType === 'string'
+                    ) {
+                        previous.value += part.value;
+                        if (previous.loc?.end && part.loc?.end) previous.loc.end = part.loc.end;
+                    } else merged.push(part);
+                }
+                if (merged.every((p) => p.type === 'Literal'))
                     return this.literal(
-                        parts[0].literalType === 'bytes'
-                            ? parts.flatMap((p) => p.value)
-                            : parts.map((p) => p.value).join(''),
-                        parts[0].literalType,
+                        merged[0].literalType === 'bytes'
+                            ? merged.flatMap((p) => p.value)
+                            : merged.map((p) => p.value).join(''),
+                        merged[0].literalType,
                         n
                     );
-                return parts.reduce((a, b) => this.binary('+', a, b, n));
+                return merged.reduce((a, b) => this.binary('+', a, b, n));
             }
             case 'expression_statement': {
                 if (c.length > 1)
@@ -588,13 +630,19 @@ export class Visitor {
                 });
             }
             case 'call': {
-                if (f('function')?.text === 'super') return this.make('SuperExpression', n);
+                const functionNode = f('function')!;
+                if (functionNode?.text === 'super') return this.make('SuperExpression', n);
                 const argumentsNode = f('arguments')!;
                 const args = this.children(argumentsNode);
                 const isKeyword = (a: SyntaxNode) =>
                     ['keyword_argument', 'dictionary_splat'].includes(a.type);
-                return this.make('CallExpression', n, {
-                    callee: v('function'),
+                // In a list such as `[*product(xs)]`, tree-sitter attaches the
+                // splat node to the call's function field. The star applies to
+                // the result of the complete call, not to the callee name.
+                const result = this.make('CallExpression', n, {
+                    callee: ['list_splat', 'dictionary_splat'].includes(functionNode.type)
+                        ? this.visit(this.children(functionNode)[0])
+                        : this.visit(functionNode),
                     arguments:
                         argumentsNode.type === 'generator_expression'
                             ? [this.visit(argumentsNode)]
@@ -602,6 +650,11 @@ export class Visitor {
                                   (a) => this.visit(a)
                               ),
                 });
+                if (functionNode.type === 'list_splat')
+                    return this.make('DereferenceExpression', n, { argument: result });
+                if (functionNode.type === 'dictionary_splat')
+                    return this.make('SpreadElement', n, { argument: result });
+                return result;
             }
             case 'keyword_argument':
                 return this.variable(this.id(this.text(f('name')!)), v('value'), n);
@@ -1158,7 +1211,11 @@ export class Visitor {
         }
         // Empty JoinedStr is null in the existing Python UAST contract.
         if (!parts.length) return null;
-        const result = parts.reduce((a, b) => this.binary('+', a, b));
+        const result = parts.reduce((a, b) => {
+            const join = this.binary('+', a, b);
+            this.fStringJoins.add(join);
+            return join;
+        });
         if (!result.loc.start) result.loc = this.location(n);
         return result;
     }
