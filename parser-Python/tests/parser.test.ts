@@ -35,6 +35,18 @@ test('bare starred tuples preserve expressions and match parenthesized tuples', 
     assert.equal(body('x = 2 * 3')[0].right.operator, '*');
 });
 
+test('bare tuple recovery does not rewrite valid splats elsewhere in a large file', () => {
+    const result = body([
+        'before = call(head, *args)',
+        'other = (head, *tail)',
+        'def backward():',
+        ' return dx, dw, db, dresidual, *([None] * 5)',
+    ].join('\n'));
+    assert.equal(result[0].right.arguments[1].type, 'DereferenceExpression');
+    assert.equal(result[1].right.elements[1].type, 'DereferenceExpression');
+    assert.equal(result[2].body.body[0].argument.elements[4].type, 'DereferenceExpression');
+});
+
 test('normalizes UTF-8 BOM and explicitly rejects unsupported string semantics', () => {
     assert.deepEqual(parser.parse('\uFEFFx = 1'), parser.parse('x = 1'));
     for (const source of [String.raw`x = "\N{SNOWMAN}"`, 'x = t"hello"'])

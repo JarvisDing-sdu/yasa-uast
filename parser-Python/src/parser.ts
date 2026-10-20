@@ -83,22 +83,36 @@ export function parse(content: string, opts: ParseOptions = {}): UAST.Node {
             // unary placeholder preserves every source location. Accept it only
             // when the resulting node is a direct item of an expression_list.
             const stars = new Set<number>();
-            let previous = '';
             const collect = (node: SyntaxNode) => {
-                if (node.type.endsWith('splat_pattern')) { previous = 'pattern'; return; }
-                if (['string', 'comment'].includes(node.type)) {
-                    if (node.type === 'string') previous = 'string';
+                let previous = '';
+                const walk = (current: SyntaxNode) => {
+                    if (current.type.endsWith('splat_pattern')) { previous = 'pattern'; return; }
+                    if (['string', 'comment'].includes(current.type)) {
+                        if (current.type === 'string') previous = 'string';
+                        return;
+                    }
+                    if (current.children.length) current.children.forEach(walk);
+                    else {
+                        if (current.type === '*' && content[current.startIndex - 1] !== '*' &&
+                            content[current.endIndex] !== '*' && [',', '=', 'return', 'yield'].includes(previous))
+                            stars.add(current.startIndex);
+                        previous = current.type;
+                    }
+                };
+                walk(node);
+            };
+            const collectErrors = (node: SyntaxNode) => {
+                // Restrict compatibility rewriting to parser error regions. A
+                // project-sized file often contains many already-valid splats;
+                // rewriting those can make the guarded retry reject an otherwise
+                // repairable bare tuple later in the file.
+                if (node.type === 'ERROR') {
+                    collect(node);
                     return;
                 }
-                if (node.children.length) node.children.forEach(collect);
-                else {
-                    if (node.type === '*' && content[node.startIndex - 1] !== '*' &&
-                        content[node.endIndex] !== '*' && [',', '=', 'return', 'yield'].includes(previous))
-                        stars.add(node.startIndex);
-                    previous = node.type;
-                }
+                node.namedChildren.forEach(collectErrors);
             };
-            collect(tree.rootNode);
+            collectErrors(tree.rootNode);
             if (stars.size) {
                 const input = content.slice(0, tree.rootNode.startIndex) + tree.rootNode.text +
                     content.slice(tree.rootNode.endIndex);
