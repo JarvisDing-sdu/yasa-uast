@@ -1,5 +1,6 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import type * as UAST from '@ant-yasa/uast-spec';
+import { legacyFieldOrder } from './legacy-field-order';
 
 // Python's legacy UAST contains extensions (float/bytes, nullable locations and
 // DynamicType string IDs) beyond the published spec. Keep that boundary explicit.
@@ -73,13 +74,19 @@ export class Visitor {
         };
     }
     private make(type: Node['type'], n: SyntaxNode | null, fields: Record<string, any> = {}): Node {
-        const result = {
-            type,
+        const values: Record<string, any> = { ...defaults[type], ...fields };
+        const result: Node = {
             loc: n ? this.location(n) : emptyLocation(),
-            _meta: { isConstructor: false, isAsync: false, decorators: null, parameterKind: null },
-            ...defaults[type],
-            ...fields,
+            _meta: { isConstructor: false, isAsync: false, decorators: [], parameterKind: null },
+            type,
         };
+        for (const key of legacyFieldOrder[type] || []) {
+            if (Object.prototype.hasOwnProperty.call(values, key)) result[key] = values[key];
+        }
+        for (const key in values) {
+            if (!Object.prototype.hasOwnProperty.call(values, key)) continue;
+            if (!Object.prototype.hasOwnProperty.call(result, key)) result[key] = values[key];
+        }
         if (['PrimitiveType', 'ArrayType', 'MapType'].includes(type))
             (result as Node).id = this.id(type);
         return result;
