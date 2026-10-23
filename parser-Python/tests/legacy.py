@@ -4,6 +4,11 @@ import json
 import pathlib
 import sys
 
+# Node sends UTF-8 source over a pipe; Windows may otherwise decode it using
+# the system code page and turn non-ASCII bytes into surrogate characters.
+sys.stdin.reconfigure(encoding='utf-8', errors='strict')
+sys.stdout.reconfigure(encoding='utf-8', errors='strict')
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from uast.visitor import UASTTransformer
 import uast.asttype as UNode
