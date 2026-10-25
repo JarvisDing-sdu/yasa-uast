@@ -1,0 +1,32 @@
+name: C tree-sitter parser
+
+on:
+  pull_request:
+    paths: ['parser-C/**', '.github/workflows/c-parser.yml']
+  push:
+    branches: [main]
+    paths: ['parser-C/**', '.github/workflows/c-parser.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: parser-C
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: parser-C/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm test
+      - run: npm pack --dry-run
