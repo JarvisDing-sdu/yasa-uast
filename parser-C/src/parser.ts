@@ -1,7 +1,7 @@
 import * as TreeSitter from 'web-tree-sitter';
 import * as UAST from '@ant-yasa/uast-spec';
 import { version } from '../package.json';
-import { collectMacros, substitute, MacroDefinition } from './macros';
+import { MacroEnvironment, substitute, MacroDefinition, PreprocessorConfig } from './macros';
 
 type SyntaxNode = TreeSitter.Node;
 
@@ -636,12 +636,16 @@ function firstNonComment(node: SyntaxNode): SyntaxNode | null {
 }
 
 /**
- * All branches of #if/#ifdef/#elif/#else are kept: a static analyzer cannot
- * know the build configuration, and header guards wrap entire files.
+ * #if/#ifdef/#elif/#else: branches the compile configuration excludes are
+ * dropped; branches it does not decide are all kept (the analysis covers each
+ * configuration), and definitions in them are marked `_meta.conditional`.
  */
 function preprocessorConditional(node: SyntaxNode, opts: Record<string, any>): any {
     const sourcefile = opts?.sourcefile as string | undefined;
-    const branch = visitStatements(unfieldedNamedChildren(node, ['name', 'condition', 'alternative']), opts);
+    const env: MacroEnvironment | undefined = opts.__macroEnv;
+    const activity = opts.__macroOffset === undefined ? env?.branchActivity(node.startIndex) : undefined;
+    const branch = activity === 'inactive' ? [] : visitStatements(unfieldedNamedChildren(node, ['name', 'condition', 'alternative']), opts);
+    if (activity === 'maybe') markConditional(branch);
     const alternative = node.childForFieldName('alternative');
     if (alternative) branch.push(...flattenInstructions([visit(alternative, opts)]));
     if (!branch.length) {
@@ -654,10 +658,58 @@ function preprocessorConditional(node: SyntaxNode, opts: Record<string, any>): a
     return appendNodeMeta(seq, node, sourcefile);
 }
 
-function lookupMacro(name: string, opts: Record<string, any>): MacroDefinition | null {
-    const macros: Map<string, MacroDefinition> | undefined = opts?.__macros;
-    if (!macros || (opts.__expanding as Set<string> | undefined)?.has(name)) return null;
-    return macros.get(name) ?? null;
+function markConditional(items: any[]): void {
+    for (const item of items) {
+        if (!item || typeof item !== 'object') continue;
+        if (item.type === 'Sequence') markConditional(item.expressions || []);
+        else if (item.type === 'FunctionDefinition' || item.type === 'VariableDeclaration') item._meta.conditional = true;
+    }
+}
+
+const STATEMENT_TYPE = /Statement$|^(Sequence|VariableDeclaration|FunctionDefinition|ClassDefinition|Noop)$/;
+
+/**
+ * Expand `name` at a use site with every definition that may be in effect
+ * there. One possible expansion is returned as is; several (a macro defined
+ * differently in configuration-dependent branches, or maybe undefined) are
+ * joined by a choice the analysis treats as unknown, so each is analyzed.
+ */
+function expandAtUseSite(
+    name: string,
+    node: SyntaxNode,
+    opts: Record<string, any>,
+    applies: (macro: MacroDefinition) => boolean,
+    expand: (macro: MacroDefinition) => any,
+    plain: () => any,
+): any {
+    const env: MacroEnvironment | undefined = opts.__macroEnv;
+    if (!env || opts.expandMacros === false || (opts.__expanding as Set<string> | undefined)?.has(name)) return plain();
+    const candidates = env.lookup(name, opts.__macroOffset ?? node.startIndex);
+    const results: any[] = [];
+    let unexpanded = false;
+    for (const macro of candidates) {
+        const result = macro && applies(macro) ? expand(macro) : null;
+        if (result) results.push(result);
+        else unexpanded = true;
+    }
+    if (unexpanded || !results.length) results.push(plain());
+    if (results.length === 1) return results[0];
+    const sourcefile = opts?.sourcefile as string | undefined;
+    const choice = (): any => {
+        const id = cIdentifier('__preprocessor_choice__', node, sourcefile);
+        id._meta.preprocessorChoice = name;
+        return id;
+    };
+    const asStatement = results.some((r) => STATEMENT_TYPE.test(r.type));
+    let combined = results[results.length - 1];
+    for (let i = results.length - 2; i >= 0; i--) {
+        combined = asStatement
+            ? UAST.ifStatement(choice(), results[i], combined)
+            : UAST.conditionalExpression(choice(), results[i], combined);
+        appendNodeMeta(combined, node, sourcefile);
+        combined._meta.macro = name;
+    }
+    return combined;
 }
 
 function relocate(value: any, loc: any, seen = new Set<any>()): void {
@@ -696,7 +748,7 @@ function expandMacro(macro: MacroDefinition, text: string, useSite: SyntaxNode, 
         const statements = (body?.namedChildren ?? []).filter((c) =>
             c.type !== 'comment' && !(c.type === 'expression_statement' && c.namedChildCount === 0));
         if (!statements.length) return null;
-        const inner = { ...opts, __expanding: new Set([...expanding, macro.name]) };
+        const inner = { ...opts, __expanding: new Set([...expanding, macro.name]), __macroOffset: opts.__macroOffset ?? useSite.startIndex };
         let result: any;
         if (statements.length === 1 && statements[0].type === 'expression_statement') {
             result = visit(namedChild(statements[0], 0), inner);
@@ -780,12 +832,14 @@ function visit(node: SyntaxNode | null | undefined, opts: Record<string, any>): 
             return null;
 
         case 'identifier': {
-            const macro = lookupMacro(node.text, opts);
-            if (macro && macro.params === null && macro.body) {
-                const expanded = expandMacro(macro, macro.body, node, opts);
-                if (expanded) return expanded;
-            }
-            return cIdentifier(node.text, node, sourcefile);
+            return expandAtUseSite(
+                node.text,
+                node,
+                opts,
+                (macro) => macro.params === null && !!macro.body,
+                (macro) => expandMacro(macro, macro.body, node, opts),
+                () => cIdentifier(node.text, node, sourcefile),
+            );
         }
 
         case 'field_identifier':
@@ -1034,20 +1088,26 @@ function visit(node: SyntaxNode | null | undefined, opts: Record<string, any>): 
 
         case 'call_expression': {
             const functionNode = node.childForFieldName('function');
-            const macro = functionNode?.type === 'identifier' ? lookupMacro(functionNode.text, opts) : null;
-            if (macro && macro.params !== null) {
-                const argTexts = (node.childForFieldName('arguments')?.namedChildren ?? [])
-                    .filter((c) => c.type !== 'comment')
-                    .map((c) => c.text);
-                const expanded = expandMacro(macro, substitute(macro, argTexts), node, opts);
-                if (expanded) return expanded;
-            }
-            const callee = expressionOrNoop(functionNode, opts);
-            const argsNode = node.childForFieldName('arguments');
-            const args = argsNode
-                ? argsNode.namedChildren.filter((c) => c.type !== 'comment').map((c) => expressionOrNoop(c, opts))
-                : [];
-            return appendNodeMeta(UAST.callExpression(callee, args), node, sourcefile);
+            const plainCall = () => {
+                const callee = expressionOrNoop(functionNode, opts);
+                const argsNode = node.childForFieldName('arguments');
+                const args = argsNode
+                    ? argsNode.namedChildren.filter((c) => c.type !== 'comment').map((c) => expressionOrNoop(c, opts))
+                    : [];
+                return appendNodeMeta(UAST.callExpression(callee, args), node, sourcefile);
+            };
+            if (functionNode?.type !== 'identifier') return plainCall();
+            const argTexts = (node.childForFieldName('arguments')?.namedChildren ?? [])
+                .filter((c) => c.type !== 'comment')
+                .map((c) => c.text);
+            return expandAtUseSite(
+                functionNode.text,
+                node,
+                opts,
+                (macro) => macro.params !== null,
+                (macro) => expandMacro(macro, substitute(macro, argTexts), node, opts),
+                plainCall,
+            );
         }
 
         case 'argument_list':
@@ -1170,7 +1230,11 @@ function collectParseErrors(root: SyntaxNode): ParseError[] {
  * Pass `{ strict: true }` to throw a SyntaxError instead.
  */
 export function parse(content: string, opts: Record<string, any> = {}): UAST.Node {
-    const tree = getParser().parse(content.replace(/^﻿/, ''));
+    const source = content.replace(/^\uFEFF/, '');
+    const config: PreprocessorConfig = opts.preprocessor ?? {};
+    const env = new MacroEnvironment(source, config, opts.sourcefile);
+    // Lines of branches the configuration excludes are blanked, so the tree only holds code that may be compiled.
+    const tree = getParser().parse(env.activeSource());
     if (!tree) throw new Error('tree-sitter failed to parse the C source');
     try {
         const root = tree.rootNode;
@@ -1179,15 +1243,15 @@ export function parse(content: string, opts: Record<string, any> = {}): UAST.Nod
             const first = errors[0];
             throw new SyntaxError(`C syntax error at ${opts.sourcefile ?? '<source>'}:${first.line}:${first.column}`);
         }
-        const macros = opts.expandMacros === false ? new Map() : collectMacros(root);
         const unit = visit(root, {
             ...opts,
             __structs: new Map<string, string[]>(),
             __unionTypes: new Set<string>(),
             __unionVars: new Set<string>(),
-            __macros: macros,
+            __macroEnv: env,
         });
         unit._meta.parseErrors = errors;
+        unit._meta.includes = env.includes;
         return unit;
     } finally {
         tree.delete();

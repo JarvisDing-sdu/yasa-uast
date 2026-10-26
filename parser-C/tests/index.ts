@@ -364,6 +364,69 @@ void f(char *buf) { g(STR(hello), CAT(my, var)); SAFE_FREE(buf); h(SELF); }`);
         });
     });
 
+    describe('preprocessor semantics', () => {
+        const calls = (code: string, opts: Record<string, any> = {}) =>
+            collect(unit(code, opts), (n) => n.type === 'CallExpression').map((c: any) => c.callee.name);
+        const sinkArg = (code: string, opts: Record<string, any> = {}): any =>
+            collect(unit(code, opts), (n) => n.type === 'CallExpression' && n.callee.name === 'sink')[0].arguments[0];
+
+        it('uses the definition in effect at the use site (#define/#undef order)', () => {
+            const code = `#define IN() safe()
+void a(void) { sink(IN()); }
+#undef IN
+#define IN() tainted()
+void b(void) { sink(IN()); }
+#undef IN
+void c(void) { sink(IN()); }`;
+            const fns = unit(code).body.filter((n: any) => n.type === 'FunctionDefinition');
+            const callee = (f: any) => f.body.body[0].expression.arguments[0].callee.name;
+            assert.deepStrictEqual(fns.map(callee), ['safe', 'tainted', 'IN']);
+        });
+
+        it('does not expand a macro before its definition', () => {
+            assert.deepStrictEqual(calls('void f(void) { sink(src()); }\n#define src() "safe"'), ['sink', 'src']);
+        });
+
+        it('evaluates conditionals under the target platform and -D/-U', () => {
+            const code = '#ifdef _WIN32\n#define IN() win()\n#else\n#define IN() posix()\n#endif\nvoid f(void) { sink(IN()); }';
+            assert.strictEqual(sinkArg(code).callee.name, 'posix');
+            assert.strictEqual(sinkArg(code, { preprocessor: { target: 'windows' } }).callee.name, 'win');
+            const feature = '#if defined(FEATURE) && LEVEL > 1\n#define IN() on()\n#else\n#define IN() off()\n#endif\nvoid f(void) { sink(IN()); }';
+            assert.strictEqual(sinkArg(feature, { preprocessor: { defines: { FEATURE: '1', LEVEL: '2' } } }).callee.name, 'on');
+            assert.strictEqual(sinkArg(feature, { preprocessor: { defines: { FEATURE: '1', LEVEL: '1' } } }).callee.name, 'off');
+            assert.strictEqual(sinkArg(feature, { preprocessor: { undefines: ['FEATURE'] } }).callee.name, 'off');
+        });
+
+        it('keeps every definition a configuration-dependent conditional may select', () => {
+            const code = '#ifdef FEATURE\n#define IN() on()\n#else\n#define IN() off()\n#endif\nvoid f(void) { sink(IN()); }';
+            const choice = sinkArg(code);
+            assert.strictEqual(choice.type, 'ConditionalExpression');
+            assert.strictEqual(choice.test._meta.preprocessorChoice, 'IN');
+            assert.deepStrictEqual([choice.consequent.callee.name, choice.alternative.callee.name], ['on', 'off']);
+            // C 标准语义：未定义的名字不是宏
+            assert.strictEqual(sinkArg(code, { preprocessor: { unknownMacros: 'undefined' } }).callee.name, 'off');
+        });
+
+        it('drops branches the configuration excludes and marks undecided ones', () => {
+            const code = '#ifdef _WIN32\nchar *pick(void) { return a(); }\n#else\nchar *pick(void) { return b(); }\n#endif\n#ifdef FEATURE\nint g(void) { return 1; }\n#endif';
+            const fns = collect(unit(code), (n) => n.type === 'FunctionDefinition');
+            assert.deepStrictEqual(fns.map((f: any) => [f.id.name, !!f._meta.conditional]), [['pick', false], ['g', true]]);
+            assert.strictEqual(fns[0].body.body[0].argument.callee.name, 'b');
+        });
+
+        it('reads macros from quoted headers at the #include', () => {
+            const headers: Record<string, string> = {
+                'input.h': '#ifndef INPUT_H\n#define INPUT_H\n#define IN() fromHeader()\n#endif\n',
+            };
+            const resolveInclude = (p: string) => (headers[p] ? { file: `/inc/${p}`, content: headers[p] } : null);
+            const code = 'void a(void) { sink(IN()); }\n#include "input.h"\nvoid b(void) { sink(IN()); }\n#undef IN\n#define IN() local()\nvoid c(void) { sink(IN()); }';
+            const u = unit(code, { preprocessor: { resolveInclude } });
+            const fns = u.body.filter((n: any) => n.type === 'FunctionDefinition');
+            assert.deepStrictEqual(fns.map((f: any) => f.body.body[0].expression.arguments[0].callee.name), ['IN', 'fromHeader', 'local']);
+            assert.deepStrictEqual(u._meta.includes, ['/inc/input.h']);
+        });
+    });
+
     describe('syntax errors', () => {
         it('records errors and keeps recovered code', () => {
             const ast = unit('int ok(void) { return 1; }\nint broken( { return 0 }\n');
