@@ -353,6 +353,21 @@ void f(char *buf) { g(STR(hello), CAT(my, var)); SAFE_FREE(buf); h(SELF); }`);
             assert.strictEqual(stmts[2].expression.arguments[0].name, 'SELF');
         });
 
+        it('expands GNU variadic macros', () => {
+            const stmts = fnBody(`#define D(fmt, args...) printf(fmt, args)
+#define LOG(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#define TAG(x) sink("## " #x)
+void f(char *a, char *b, char *buf) { D("%s %s", a, b); LOG(buf); LOG("%s", buf); TAG(y); }`);
+            const call = (i: number) => stmts[i].expression;
+            // 具名变参收集其余全部参数
+            assert.deepStrictEqual(call(0).arguments.map((x: any) => x.value ?? x.name), ['%s %s', 'a', 'b']);
+            // `, ## __VA_ARGS__` 在变参为空时去掉逗号
+            assert.deepStrictEqual([call(1).callee.name, call(1).arguments.map((x: any) => x.name)], ['printf', ['buf']]);
+            assert.deepStrictEqual(call(2).arguments.map((x: any) => x.value ?? x.name), ['%s', 'buf']);
+            // 字符串字面量里的 ## 不是粘贴运算符
+            assert.strictEqual(call(3).arguments[0].value, '## y');
+        });
+
         it('keeps macros whose replacement is not a complete statement', () => {
             const stmts = fnBody('#define BEGIN {\nvoid f(void) { g(BEGIN); }');
             assert.strictEqual(stmts[0].expression.arguments[0].name, 'BEGIN');
@@ -405,6 +420,29 @@ void c(void) { sink(IN()); }`;
             assert.deepStrictEqual([choice.consequent.callee.name, choice.alternative.callee.name], ['on', 'off']);
             // C 标准语义：未定义的名字不是宏
             assert.strictEqual(sinkArg(code, { preprocessor: { unknownMacros: 'undefined' } }).callee.name, 'off');
+        });
+
+        it('restores the state before a nested conditional in later branches of the enclosing one', () => {
+            const code = `#ifdef A
+#  ifdef B
+#    define IN() one()
+#  else
+#    define IN() two()
+#  endif
+#else
+void f(void) { sink(IN()); }
+#endif
+#ifndef IN
+int only_without_in(void) { return 0; }
+#endif
+void g(void) { sink(IN()); }`;
+            const fns = collect(unit(code), (n) => n.type === 'FunctionDefinition');
+            assert.deepStrictEqual(fns.map((fn: any) => fn.id.name), ['f', 'only_without_in', 'g']);
+            // 外层 #else 路径上 IN 从未定义
+            assert.strictEqual(fns[0].body.body[0].expression.arguments[0].callee.name, 'IN');
+            // 之后 IN 可能是 one()、two() 或未定义
+            const after = collect(fns[2], (n) => n.type === 'CallExpression' && n.callee.name !== 'sink').map((c: any) => c.callee.name);
+            assert.deepStrictEqual(after.sort(), ['IN', 'one', 'two']);
         });
 
         it('drops branches the configuration excludes and marks undecided ones', () => {

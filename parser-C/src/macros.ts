@@ -5,6 +5,8 @@ export interface MacroDefinition {
     /** Parameter names for function-like macros; `null` for object-like ones. */
     params: string[] | null;
     variadic: boolean;
+    /** GNU named variable arguments (`args...`); not part of `params`. */
+    variadicParam?: string;
     body: string;
 }
 
@@ -151,17 +153,18 @@ function parseDefine(rest: string): MacroDefinition | null {
     const [, name, paren, paramText, body] = m;
     let params: string[] | null = null;
     let variadic = false;
+    let variadicParam: string | undefined;
     if (paren !== undefined) {
         params = [];
         for (const p of paramText.split(',').map((x) => x.trim()).filter(Boolean)) {
             if (p === '...') variadic = true;
             else if (p.endsWith('...')) {
                 variadic = true;
-                params.push(p.slice(0, -3).trim());
+                variadicParam = p.slice(0, -3).trim();
             } else params.push(p);
         }
     }
-    return { name, params, variadic, body: body.trim() };
+    return { name, params, variadic, ...(variadicParam ? { variadicParam } : {}), body: body.trim() };
 }
 
 function parseIntegerLiteral(text: string): number | undefined {
@@ -416,7 +419,10 @@ export class MacroEnvironment {
                     if (group?.parentLive) {
                         if (group.live) group.frame.branches.push(group.frame.branch);
                         this.frames.pop();
+                        const outer = this.frames[this.frames.length - 1];
                         for (const [name, entry] of group.frame.entry) {
+                            // Unchanged in the enclosing group so far, so its value there is the one before this group.
+                            if (outer && !outer.entry.has(name)) outer.entry.set(name, entry);
                             const outcomes = group.frame.branches.map((b) => (b.has(name) ? b.get(name) : entry));
                             if (!group.decided) outcomes.push(entry);
                             this.set(name, union(outcomes, this.unseen), line.end);
@@ -595,22 +601,33 @@ export class MacroEnvironment {
     }
 }
 
-const LITERAL_OR_IDENT = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(#\s*#)|(#\s*[A-Za-z_]\w*)|([A-Za-z_]\w*)/g;
+const LITERAL_OR_IDENT = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(,\s*#\s*#\s*([A-Za-z_]\w*))|(#\s*#)|(#\s*[A-Za-z_]\w*)|([A-Za-z_]\w*)/g;
+const LITERAL_OR_PASTE = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\s*##\s*/g;
 
-/** Replace parameters in a function-like macro body, handling `#x`, `a ## b` and `__VA_ARGS__`. */
+/**
+ * Replace parameters in a function-like macro body, handling `#x`, `a ## b`,
+ * `__VA_ARGS__`, GNU named variable arguments and GNU `, ## __VA_ARGS__`.
+ */
 export function substitute(macro: MacroDefinition, args: string[]): string {
     const params = macro.params || [];
     const values = new Map<string, string>();
     params.forEach((param, index) => values.set(param, (args[index] ?? '').trim()));
-    if (macro.variadic) values.set('__VA_ARGS__', args.slice(params.length).map((a) => a.trim()).join(', '));
+    const variadicName = macro.variadicParam ?? '__VA_ARGS__';
+    if (macro.variadic) values.set(variadicName, args.slice(params.length).map((a) => a.trim()).join(', '));
 
-    const replaced = macro.body.replace(LITERAL_OR_IDENT, (all, literal, paste, stringify, ident) => {
+    const replaced = macro.body.replace(LITERAL_OR_IDENT, (all, literal, commaPaste, pasted, paste, stringify, ident) => {
         if (literal || paste) return all;
+        if (commaPaste) {
+            // GNU: `, ## __VA_ARGS__` drops the comma when there are no variable arguments.
+            if (macro.variadic && pasted === variadicName) return values.get(variadicName) ? `, ${values.get(variadicName)}` : '';
+            return `,##${values.has(pasted) ? values.get(pasted) : pasted}`;
+        }
         if (stringify) {
             const name = stringify.replace(/^#\s*/, '');
             return values.has(name) ? JSON.stringify(values.get(name)) : all;
         }
         return values.has(ident) ? values.get(ident)! : all;
     });
-    return replaced.replace(/\s*##\s*/g, '');
+    // `##` inside string or char literals is text, not the paste operator.
+    return replaced.replace(LITERAL_OR_PASTE, (all, literal) => literal ?? '');
 }
