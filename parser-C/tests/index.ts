@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { init, parse } from '../src/parser';
 import { Parser } from '../src';
+import { MacroEnvironment } from '../src/macros';
 
 const unit = (code: string, opts: Record<string, any> = {}): any => parse(code, { sourcefile: 't.c', ...opts });
 const body = (code: string): any[] => unit(code).body;
@@ -462,6 +463,113 @@ void g(void) { sink(IN()); }`;
             const fns = u.body.filter((n: any) => n.type === 'FunctionDefinition');
             assert.deepStrictEqual(fns.map((f: any) => f.body.body[0].expression.arguments[0].callee.name), ['IN', 'fromHeader', 'local']);
             assert.deepStrictEqual(u._meta.includes, ['/inc/input.h']);
+        });
+
+        it('keeps a function whose active else braces cross conditional directives', () => {
+            const code = fs.readFileSync(path.join(__dirname, 'fixtures/conditional-boundary/split-else.c'), 'utf8');
+            const ast = unit(code, { preprocessor: { target: 'none', unknownMacros: 'undefined', defines: { USE_UNIX_SOCKETS: '1' } } });
+            const fn = ast.body.find((n: any) => n.type === 'FunctionDefinition' && n.id.name === 'split_else');
+            assert.ok(fn, 'the function must not be replaced by recovered file-level statements');
+            assert.deepStrictEqual(fn.id.loc.start, { line: 36, column: 17 });
+            const inner = fn.body.body.find((n: any) => n.type === 'IfStatement');
+            assert.deepStrictEqual(inner.loc.start, { line: 41, column: 3 });
+            assert.strictEqual(ast.body.filter((n: any) => n.type === 'IfStatement').length, 0);
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+        });
+
+        it('excludes the same split else when its feature is undefined', () => {
+            const code = fs.readFileSync(path.join(__dirname, 'fixtures/conditional-boundary/split-else.c'), 'utf8');
+            const ast = unit(code, { preprocessor: { target: 'none', unknownMacros: 'undefined' } });
+            const fn = ast.body.find((n: any) => n.type === 'FunctionDefinition' && n.id.name === 'split_else');
+            assert.ok(fn);
+            assert.strictEqual(collect(fn, (n) => n.type === 'IfStatement').length, 0);
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+        });
+
+        it('keeps locations across continued conditions and nested resolved groups', () => {
+            const code = '#ifndef HEADER_H\n#define HEADER_H\nvoid f(void) {\n#if defined(ENABLED) && \\\n    ENABLED == 1\n  if(test())\n    yes();\n  else {\n#endif\n    fallback();\n#if ENABLED == 1\n  }\n#endif\n}\n#endif\n';
+            const ast = unit(code, { preprocessor: { defines: { ENABLED: '1' }, unknownMacros: 'undefined' } });
+            const fn = ast.body.find((n: any) => n.type === 'FunctionDefinition');
+            assert.ok(fn);
+            assert.deepStrictEqual(fn.id.loc.start, { line: 3, column: 6 });
+            const branch = fn.body.body.find((n: any) => n.type === 'IfStatement');
+            assert.deepStrictEqual(branch.loc.start, { line: 6, column: 3 });
+            assert.deepStrictEqual(calls(code, { preprocessor: { defines: { ENABLED: '1' }, unknownMacros: 'undefined' } }), ['test', 'yes', 'fallback']);
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+        });
+
+        it('keeps unknown groups inside a resolved group structurally represented', () => {
+            const code = '#if ENABLED\n#ifdef UNKNOWN\nvoid a(void) { one(); }\n#else\nvoid b(void) { two(); }\n#endif\n#endif\n';
+            const ast = unit(code, { preprocessor: { defines: { ENABLED: '1' } } });
+            const fns = ast.body.filter((n: any) => n.type === 'FunctionDefinition');
+            assert.deepStrictEqual(fns.map((n: any) => n.id.name), ['a', 'b']);
+            assert.strictEqual(fns[0]._meta.conditional, true);
+            assert.deepStrictEqual(calls(code, { preprocessor: { defines: { ENABLED: '1' } } }), ['one', 'two']);
+        });
+
+        it('resolves a nested group without removing its uncertain enclosing group', () => {
+            const code = '#ifdef UNKNOWN\n#if ENABLED\nvoid a(void) { one(); }\n#else\nvoid discarded(void) { no(); }\n#endif\n#else\nvoid b(void) { two(); }\n#endif\n';
+            const ast = unit(code, { preprocessor: { defines: { ENABLED: '1' } } });
+            const fns = ast.body.filter((n: any) => n.type === 'FunctionDefinition');
+            assert.deepStrictEqual(fns.map((n: any) => n.id.name), ['a', 'b']);
+            assert.strictEqual(fns[0]._meta.conditional, true);
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+        });
+
+        it('retains uncertainty when an earlier branch is unknown and a later elif is true', () => {
+            const code = '#if UNKNOWN\nvoid a(void) { one(); }\n#elif 1\nvoid b(void) { two(); }\n#endif\n';
+            const ast = unit(code);
+            const fns = ast.body.filter((n: any) => n.type === 'FunctionDefinition');
+            assert.deepStrictEqual(fns.map((n: any) => n.id.name), ['a', 'b']);
+            assert.strictEqual(fns[0]._meta.conditional, true);
+            assert.deepStrictEqual(calls(code), ['one', 'two']);
+        });
+
+        it('retains selected elif macro definitions and their use-site timeline', () => {
+            const code = '#if 0\n#define PICK() wrong()\n#elif ENABLED\n#define PICK() selected()\n#else\n#define PICK() other()\n#endif\nvoid a(void) { sink(PICK()); }\n#undef PICK\n#define PICK() later()\nvoid b(void) { sink(PICK()); }\n';
+            assert.deepStrictEqual(calls(code, { preprocessor: { defines: { ENABLED: '1' }, unknownMacros: 'undefined' } }), ['sink', 'selected', 'sink', 'later']);
+        });
+
+        it('preserves syntax diagnostics for unfinished or malformed conditional directives', () => {
+            for (const code of ['#if 1\nint value;\n', '#ifdef\nint value;\n#endif\n', '#if 1\nint value;\n#endif garbage\n', '#ifdef ENABLED extra\nint value;\n#endif\n']) {
+                const opts = { preprocessor: { unknownMacros: 'undefined' } };
+                assert.ok(unit(code, opts)._meta.parseErrors.length > 0);
+                assert.throws(() => unit(code, { ...opts, strict: true }), SyntaxError);
+            }
+        });
+
+        it('does not normalize structurally invalid conditional groups', () => {
+            for (const code of ['#if 1\nint a;\n#else\nint b;\n#else\nint c;\n#endif\n', '#if 1\nint a;\n#else\nint b;\n#elif 1\nint c;\n#endif\n']) {
+                const active = new MacroEnvironment(code, { unknownMacros: 'undefined' }, 't.c').activeSource();
+                assert.ok(active.includes('#if 1'));
+                assert.ok(active.includes('#else'));
+            }
+        });
+
+        it('preserves CRLF and token offsets while masking continued resolved directives', () => {
+            const code = '#if defined(ENABLED) && \\\r\n    ENABLED == 1\r\nvoid f(void) { call(); }\r\n#else\r\nvoid discarded(void) {}\r\n#endif\r\n';
+            const config = { defines: { ENABLED: '1' }, unknownMacros: 'undefined' as const };
+            const active = new MacroEnvironment(code, config, 't.c').activeSource();
+            assert.strictEqual(active.length, code.length);
+            assert.strictEqual(active.indexOf('void f'), code.indexOf('void f'));
+            assert.strictEqual(active.indexOf('call()'), code.indexOf('call()'));
+            for (let i = 0; i < code.length; i++) {
+                if (code[i] === '\r' || code[i] === '\n') assert.strictEqual(active[i], code[i]);
+            }
+            assert.ok(!active.includes('ENABLED'));
+            const ast = unit(code, { preprocessor: config });
+            const fn = ast.body.find((n: any) => n.type === 'FunctionDefinition');
+            assert.strictEqual(fn.id.name, 'f');
+            assert.deepStrictEqual(fn.id.loc.start, { line: 3, column: 6 });
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+        });
+
+        it('handles a large resolved conditional group without argument-count limits', () => {
+            const code = '#if 1\nint value;\n' + '#elif 0\n'.repeat(150000) + '#endif\n';
+            const active = new MacroEnvironment(code, { unknownMacros: 'undefined' }, 'large.c').activeSource();
+            assert.strictEqual(active.length, code.length);
+            assert.strictEqual(active.indexOf('int value;'), 6);
+            assert.ok(!active.includes('#elif'));
         });
     });
 

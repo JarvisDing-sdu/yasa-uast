@@ -74,6 +74,12 @@ interface Group {
     live: boolean;
     /** A branch that is certainly taken has been seen. */
     decided: boolean;
+    /** A preceding branch can still be selected by an unknown configuration. */
+    uncertain: boolean;
+    /** Only matched, syntactically well-formed groups may lose their directives. */
+    wellFormed: boolean;
+    elseSeen: boolean;
+    directives: Array<[number, number]>;
     frame: GroupFrame;
 }
 
@@ -239,6 +245,7 @@ export class MacroEnvironment {
     private includeOffset: number | null = null;
     private readonly unseen: MacroValue;
     private inactiveRanges: Array<[number, number]> = [];
+    private resolvedDirectiveRanges: Array<[number, number]> = [];
     /** Headers read through `#include`, in inclusion order. */
     readonly includes: string[] = [];
 
@@ -257,11 +264,17 @@ export class MacroEnvironment {
         this.scan(source, true);
     }
 
-    /** The source with lines of excluded branches replaced by spaces (offsets unchanged). */
+    /**
+     * Exclude inactive code and resolved conditional directives without moving
+     * source locations. Even an active #if can split an otherwise balanced C
+     * construct (for example the opening and closing brace of an else body),
+     * so tree-sitter must see the selected C code without those separators.
+     * Unknown groups retain their directives and their conditional metadata.
+     */
     activeSource(): string {
-        if (!this.inactiveRanges.length) return this.source;
+        if (!this.inactiveRanges.length && !this.resolvedDirectiveRanges.length) return this.source;
         const out = this.source.split('');
-        for (const [start, end] of this.inactiveRanges) {
+        for (const [start, end] of [...this.inactiveRanges, ...this.resolvedDirectiveRanges]) {
             for (let i = start; i < end && i < out.length; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
         }
         return out.join('');
@@ -376,7 +389,12 @@ export class MacroEnvironment {
                             truth = directive === 'ifndef' && this.isIncludeGuard(name, lines, index) ? true : this.definedTruth(name, directive === 'ifndef');
                         }
                     }
-                    const group: Group = { parentLive, live: parentLive && truth !== false, decided: truth === true, frame };
+                    const group: Group = {
+                        parentLive, live: parentLive && truth !== false, decided: truth === true,
+                        uncertain: truth === undefined,
+                        wellFormed: directive === 'if' ? !!rest.trim() : /^\s*[A-Za-z_]\w*\s*$/.test(rest),
+                        elseSeen: false, directives: [[line.start, line.end]], frame,
+                    };
                     if (parentLive) {
                         this.frames.push(frame);
                         this.recordActivity(main, hash, group.live ? (truth === true ? 'active' : 'maybe') : 'inactive');
@@ -391,12 +409,21 @@ export class MacroEnvironment {
                 case 'else': {
                     const group = groups[groups.length - 1];
                     if (!group) break;
+                    group.directives.push([line.start, line.end]);
+                    if (group.elseSeen) group.wellFormed = false;
+                    if (directive === 'else') {
+                        group.elseSeen = true;
+                        if (rest.trim()) group.wellFormed = false;
+                    } else if (directive === 'elif' ? !rest.trim() : !/^\s*[A-Za-z_]\w*\s*$/.test(rest)) {
+                        group.wellFormed = false;
+                    }
                     if (group.parentLive) {
                         if (group.live) group.frame.branches.push(group.frame.branch);
                         let truth: boolean | undefined = true;
                         if (group.decided) truth = false;
                         else if (directive === 'elif') truth = this.truth(rest);
                         else if (directive !== 'else') truth = this.definedTruth(rest.trim().split(/\s+/)[0] ?? '', directive === 'elifndef');
+                        group.uncertain = group.uncertain || truth === undefined;
                         group.live = truth !== false;
                         if (truth === true) group.decided = true;
                         this.recordActivity(main, hash, group.live ? (truth === true ? 'active' : 'maybe') : 'inactive');
@@ -412,6 +439,12 @@ export class MacroEnvironment {
                 }
                 case 'endif': {
                     const group = groups.pop();
+                    if (group) {
+                        group.directives.push([line.start, line.end]);
+                        if (main && group.wellFormed && !rest.trim() && !group.uncertain) {
+                            for (const range of group.directives) this.resolvedDirectiveRanges.push(range);
+                        }
+                    }
                     if (main && inactiveFrom !== null) {
                         this.inactiveRanges.push([inactiveFrom, line.start]);
                         inactiveFrom = null;
