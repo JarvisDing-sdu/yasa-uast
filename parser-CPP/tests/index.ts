@@ -22,10 +22,10 @@ function collect(node: any, predicate: (n: any) => boolean): any[] {
     return found;
 }
 
-/** UAST without fields that legitimately differ between the C and C++ grammars. */
+/** UAST without fields that legitimately differ between the C and C++ parsers (C++ adds namespace context). */
 function comparable(node: any): any {
     return JSON.parse(JSON.stringify(node, (key, value) => {
-        if (key === 'parent' || key === 'origin' || key === 'language' || key === 'languageVersion') return undefined;
+        if (['parent', 'origin', 'language', 'languageVersion', 'namespaceContext'].includes(key)) return undefined;
         return value;
     }));
 }
@@ -59,6 +59,108 @@ describe('parser-CPP', () => {
             const unit: any = cpp.parse('#ifdef __cplusplus\nint in_cpp(void) { return 1; }\n#else\nint in_c(void) { return 0; }\n#endif\n');
             const names = collect(unit, (n) => n.type === 'FunctionDefinition').map((f) => f.id.name);
             assert.deepStrictEqual(names, ['in_cpp']);
+        });
+    });
+
+    describe('namespaces', () => {
+        const fns = (code: string) => collect(cpp.parse(code), (n) => n.type === 'FunctionDefinition');
+        const calls = (code: string) => collect(cpp.parse(code), (n) => n.type === 'CallExpression');
+
+        it('encodes functions inside nested namespaces', () => {
+            const unit: any = cpp.parse('namespace A { namespace B { int f(void) { return 1; } int g; } }\nnamespace C::D { void h() {} }\nint top(void) { return 0; }');
+            const byName = Object.fromEntries(collect(unit, (n) => n.type === 'FunctionDefinition').map((f) => [f.id.name, f._meta]));
+            assert.strictEqual(byName.f.namespace, 'A::B');
+            assert.strictEqual(byName.f.qualifiedName, 'A::B::f');
+            assert.strictEqual(byName.h.qualifiedName, 'C::D::h');
+            assert.strictEqual(byName.top.namespace, undefined);
+            const g = collect(unit, (n) => n.type === 'VariableDeclaration' && n.id.name === 'g')[0];
+            assert.strictEqual(g._meta.qualifiedName, 'A::B::g');
+        });
+
+        it('encodes functions defined with a qualified name outside their namespace', () => {
+            const [k] = fns('void A::B::k() {}');
+            assert.strictEqual(k.id.name, 'k');
+            assert.strictEqual(k._meta.qualifiedName, 'A::B::k');
+        });
+
+        it('keeps members of an anonymous namespace in the enclosing namespace', () => {
+            const [hidden] = fns('namespace A { namespace { void hidden() {} } }');
+            assert.strictEqual(hidden._meta.qualifiedName, 'A::hidden');
+            assert.strictEqual(hidden._meta.anonymousNamespace, true);
+        });
+
+        it('encodes qualified calls including std::', () => {
+            const [system, f, g] = calls('void h(char *x) { std::system(x); A::B::f(); ::g(); }');
+            assert.deepStrictEqual([system.callee.name, system.callee._meta.qualifier], ['system', 'std']);
+            assert.deepStrictEqual([f.callee.name, f.callee._meta.qualifier], ['f', 'A::B']);
+            assert.deepStrictEqual([g.callee.name, g.callee._meta.qualifier], ['g', '']);
+        });
+
+        it('records namespace context on unqualified identifiers', () => {
+            const [inner, outer] = calls('namespace A { void bad(char *d) { run(d); } }\nvoid top(char *d) { run(d); }');
+            assert.strictEqual(inner.callee._meta.namespaceContext, 'A');
+            assert.strictEqual(inner.arguments[0]._meta.namespaceContext, 'A');
+            assert.strictEqual(outer.callee._meta.namespaceContext, '');
+        });
+
+        it('records using directives and declarations', () => {
+            const unit: any = cpp.parse('namespace N { using namespace A; }\nusing A::B::f;');
+            const usings = collect(unit, (n) => n.type === 'Noop' && (n._meta.usingNamespace || n._meta.usingDeclaration));
+            assert.deepStrictEqual(usings.map((u) => [u._meta.usingNamespace, u._meta.usingDeclaration, u._meta.namespaceContext]), [
+                ['A', undefined, 'N'],
+                [undefined, 'A::B::f', ''],
+            ]);
+        });
+
+        it('expands a macro containing a qualified name', () => {
+            const [call] = calls('#define RUN std::system\nvoid f(char *c) { RUN(c); }');
+            assert.deepStrictEqual([call.callee.name, call.callee._meta.qualifier], ['system', 'std']);
+        });
+    });
+
+    describe('statements and expressions', () => {
+        const fnBody = (code: string): any[] => collect(cpp.parse(code), (n) => n.type === 'FunctionDefinition')[0].body.body;
+
+        it('maps condition_clause with and without init statement', () => {
+            const [plain] = fnBody('void f(int x) { if (x) g(); }');
+            assert.strictEqual(plain.type, 'IfStatement');
+            assert.strictEqual(plain.test.name, 'x');
+
+            const [withInit] = fnBody('void f() { if (char *d = getenv("X"); d) system(d); }');
+            assert.strictEqual(withInit.type, 'ScopedStatement');
+            assert.deepStrictEqual(withInit.body.map((s: any) => s.type), ['VariableDeclaration', 'IfStatement']);
+            assert.strictEqual(withInit.body[0].init.callee.name, 'getenv');
+            assert.strictEqual(withInit.body[1].test.name, 'd');
+
+            const [declared] = fnBody('void f() { if (char *d = getenv("X")) system(d); }');
+            assert.deepStrictEqual(declared.body.map((s: any) => s.type), ['VariableDeclaration', 'IfStatement']);
+            assert.strictEqual(declared.body[1].test.name, 'd');
+        });
+
+        it('maps nullptr and C++ casts', () => {
+            const [a, b, c] = fnBody('void f(void *v) { char *p = nullptr; char *q = static_cast<char *>(v); long n = reinterpret_cast<long>(q); }');
+            assert.strictEqual(a.init.type, 'Literal');
+            assert.strictEqual(a.init.value, null);
+            assert.strictEqual(b.init.type, 'CastExpression');
+            assert.strictEqual(b.init.expression.name, 'v');
+            assert.strictEqual(c.init.type, 'CastExpression');
+            assert.strictEqual(c.init.expression.name, 'q');
+        });
+
+        it('marks reference parameters and variables', () => {
+            const [f] = collect(cpp.parse('void f(int &x, char *&p, int &&m, int plain) { int &r = x; char * &dataRef = p; int v = x; }'),
+                (n) => n.type === 'FunctionDefinition');
+            assert.deepStrictEqual(f.parameters.map((p: any) => [p.id.name, p._meta.reference]),
+                [['x', 'lvalue'], ['p', 'lvalue'], ['m', 'rvalue'], ['plain', undefined]]);
+            assert.deepStrictEqual(f.body.body.map((d: any) => [d.id.name, d._meta.reference]),
+                [['r', 'lvalue'], ['dataRef', 'lvalue'], ['v', undefined]]);
+        });
+
+        it('keeps functions around unparseable template code', () => {
+            const unit: any = cpp.parse('int a(void) { return 1; }\ntemplate <typename T> T bad(T x) { return x <<>> ; }\nint b(void) { return 2; }');
+            const names = collect(unit, (n) => n.type === 'FunctionDefinition').map((f) => f.id.name);
+            assert.ok(names.includes('a') && names.includes('b'), names.join(','));
+            assert.ok(unit._meta.parseErrors.length > 0);
         });
     });
 });
