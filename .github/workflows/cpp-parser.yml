@@ -1,0 +1,34 @@
+name: C++ tree-sitter parser
+
+on:
+  pull_request:
+    paths: ['parser-CPP/**', 'parser-C/**', '.github/workflows/cpp-parser.yml']
+  push:
+    branches: [main]
+    paths: ['parser-CPP/**', 'parser-C/**', '.github/workflows/cpp-parser.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build parser-C
+        working-directory: parser-C
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+      - name: Test parser-CPP
+        working-directory: parser-CPP
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          npm test
