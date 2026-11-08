@@ -2,7 +2,7 @@ import 'mocha';
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
-import { init, parse } from '../src/parser';
+import { init, parse, parseWithParser, initLanguage } from '../src/parser';
 import { Parser } from '../src';
 import { MacroEnvironment } from '../src/macros';
 
@@ -597,6 +597,50 @@ void g(void) { sink(IN()); }`;
             assert.deepStrictEqual(collect(ast, (n) => n.type === 'FunctionDefinition').map((f) => f.id.name), [
                 'test_command_injection', 'test_format_string', 'test_buffer_overflow', 'test_exec_family', 'main',
             ]);
+        });
+    });
+
+    describe('extension point', () => {
+        // A second, independent tree-sitter parser for the same grammar, as another language package would create.
+        const ownParser = () => initLanguage(require.resolve('tree-sitter-c/tree-sitter-c.wasm'));
+
+        it('lets an extension handle a node type and fall back to the default', async () => {
+            const code = 'int f(void) { return g(1); }';
+            const ast: any = parseWithParser(await ownParser(), code, {
+                sourcefile: 't.c',
+                extensions: {
+                    call_expression: (node, opts, next) => {
+                        const result = next(node, opts);
+                        result._meta.seen = true;
+                        return result;
+                    },
+                },
+            });
+            const call = collect(ast, (n) => n.type === 'CallExpression')[0];
+            assert.strictEqual(call.callee.name, 'g');
+            assert.strictEqual(call._meta.seen, true);
+            const plain: any = unit(code);
+            assert.strictEqual(collect(plain, (n) => n.type === 'CallExpression')[0]._meta.seen, undefined);
+        });
+
+        it("uses the caller's tree-sitter parser for macro expansion", async () => {
+            const parser = await ownParser();
+            const original = parser.parse.bind(parser);
+            let calls = 0;
+            (parser as any).parse = (...args: any[]) => {
+                calls++;
+                return (original as any)(...args);
+            };
+            const ast: any = parseWithParser(parser, '#define X g(1)\nint f(void) { return X; }', { sourcefile: 't.c' });
+            assert.strictEqual(collect(ast, (n) => n.type === 'CallExpression')[0].callee.name, 'g');
+            assert.strictEqual(calls, 2, 'one parse for the file and one for the macro replacement');
+        });
+
+        it('records the requested language on the compile unit', async () => {
+            const parser = await ownParser();
+            assert.strictEqual((parseWithParser(parser, 'int x;', { language: 'cpp' }) as any).language, 'cpp');
+            assert.strictEqual((parseWithParser(parser, 'int x;') as any).language, 'c');
+            assert.strictEqual(unit('int x;').language, 'c');
         });
     });
 });
