@@ -43,6 +43,13 @@ const withConditionDeclarations: NodeHandler = (node, opts, next) => {
         ...[condition.childForFieldName('value')].filter((v: any) => v?.type === 'declaration'),
     ];
     if (!declarations.length) return next(node, opts);
+    if (node.type === 'while_statement') {
+        const loop = next(node, opts);
+        loop.test = internals.appendNodeMeta(UAST.sequence([
+            ...internals.visitStatements(declarations, opts), loop.test,
+        ]), condition, opts.sourcefile);
+        return internals.appendNodeMeta(UAST.scopedStatement([loop]), node, opts.sourcefile);
+    }
     const scoped = UAST.scopedStatement(internals.flattenInstructions([
         ...internals.visitStatements(declarations, opts),
         next(node, opts),
@@ -50,7 +57,13 @@ const withConditionDeclarations: NodeHandler = (node, opts, next) => {
     return internals.appendNodeMeta(scoped, node, opts.sourcefile);
 };
 
+const rawString: NodeHandler = (node, opts) => {
+    const content = node.namedChildren.find((child: any) => child.type === 'raw_string_content');
+    return internals.appendNodeMeta(UAST.literal(content?.text ?? '', 'string'), node, opts.sourcefile);
+};
+
 export const expressionHandlers: Record<string, NodeHandler> = {
+    raw_string_literal: rawString,
     call_expression: callExpression,
     condition_clause: conditionClause,
     if_statement: withConditionDeclarations,

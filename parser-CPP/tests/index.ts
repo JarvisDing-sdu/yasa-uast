@@ -164,3 +164,32 @@ describe('parser-CPP', () => {
         });
     });
 });
+
+
+describe('M1 review parser regressions', () => {
+    before(async () => { await cpp.init(); });
+    it('retains namespace context and absolute qualification on qualified identifiers', () => {
+        const calls = collect(cpp.parse('namespace X { void f(){ B::g(); ::g(); } }'), n => n.type === 'CallExpression');
+        assert.strictEqual(calls[0].callee._meta.namespaceContext, 'X');
+        assert.strictEqual(calls[0].callee._meta.globalQualified, false);
+        assert.strictEqual(calls[1].callee._meta.globalQualified, true);
+    });
+    it('visits out-of-line namespace function bodies in their owning namespace', () => {
+        const calls = collect(cpp.parse('namespace X { void f(); } void X::f(){ g(); }'), n => n.type === 'CallExpression');
+        assert.strictEqual(calls[0].callee._meta.namespaceContext, 'X');
+    });
+    it('evaluates a while condition declaration inside the loop test', () => {
+        const loops = collect(cpp.parse('void f(){ while(char *p = next()) use(p); }'), n => n.type === 'WhileStatement');
+        assert.strictEqual(loops[0].test.type, 'Sequence');
+        assert.strictEqual(loops[0].test.expressions[0].type, 'VariableDeclaration');
+        assert.strictEqual(loops[0].test.expressions[0].init?.callee?.name, 'next');
+        assert.strictEqual(loops[0].test.expressions[1].name, 'p');
+    });
+    it('keeps raw string contents without decoding backslashes or custom delimiters', () => {
+        const d: any = cpp.parse('void f(){const char *s=R"tag(a\\nb)tag"; const char *t=R"()";}');
+        const decls = collect(d, n => n.type === 'VariableDeclaration');
+        assert.strictEqual(decls[0].init.type, 'Literal');
+        assert.strictEqual(decls[0].init.value, 'a\\nb');
+        assert.strictEqual(decls[1].init.value, '');
+    });
+});

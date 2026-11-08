@@ -1,6 +1,6 @@
-import { NodeHandler } from '@ant-yasa/uast-parser-c';
+import { internals, NodeHandler } from '@ant-yasa/uast-parser-c';
 import {
-    IN_FUNCTION, SyntaxNode, currentNamespace, declaredName, flatten, joinScope, referenceKind, splitQualified,
+    IN_FUNCTION, NAMESPACE, SyntaxNode, currentNamespace, declaredName, flatten, joinScope, referenceKind, splitQualified,
 } from './common';
 
 /**
@@ -41,12 +41,12 @@ function functionDeclarator(node: SyntaxNode | null): SyntaxNode | null {
  * in-function flag so local variables are not taken for namespace members.
  */
 const functionDefinition: NodeHandler = (node, opts, next) => {
-    const result = next(node, { ...opts, [IN_FUNCTION]: true });
-    if (result?.type !== 'FunctionDefinition') return result;
     const declarator = functionDeclarator(node.childForFieldName('declarator'));
     const nameNode = declarator?.childForFieldName('declarator');
     const qualifier = nameNode?.type === 'qualified_identifier' ? splitQualified(nameNode).qualifier : '';
-    const namespace = joinScope(currentNamespace(opts), qualifier);
+    const namespace = nameNode?.text.trimStart().startsWith('::') ? qualifier : joinScope(currentNamespace(opts), qualifier);
+    const result = next(node, { ...opts, [IN_FUNCTION]: true, [NAMESPACE]: namespace });
+    if (result?.type !== 'FunctionDefinition') return result;
     if (namespace) {
         result._meta.namespace = namespace;
         if (result.id?.name) result._meta.qualifiedName = joinScope(namespace, result.id.name);
@@ -62,6 +62,12 @@ const functionDefinition: NodeHandler = (node, opts, next) => {
 const declaration: NodeHandler = (node, opts, next) => {
     const result = next(node, opts);
     const declarations = flatten([result]);
+    // tree-sitter-cpp condition declarations put the initializer in `value`,
+    // rather than wrapping the declarator in C's init_declarator.
+    const value = node.childForFieldName('value');
+    if (value && declarations.length === 1 && declarations[0]?.type === 'VariableDeclaration' && !declarations[0].init) {
+        declarations[0].init = internals.expressionOrNoop(value, opts);
+    }
     markReferences(node.childrenForFieldName('declarator'), declarations);
     const namespace = currentNamespace(opts);
     if (namespace && !opts[IN_FUNCTION]) {

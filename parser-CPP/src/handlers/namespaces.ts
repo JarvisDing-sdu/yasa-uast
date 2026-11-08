@@ -43,6 +43,8 @@ const qualifiedIdentifier: NodeHandler = (node, opts, next) => {
     if (name?.type !== 'identifier') return next(node, opts);
     const id = internals.cIdentifier(name.text, node, opts.sourcefile);
     id._meta.qualifier = qualifier;
+    id._meta.globalQualified = node.text.trimStart().startsWith('::');
+    id._meta.namespaceContext = currentNamespace(opts);
     return id;
 };
 
