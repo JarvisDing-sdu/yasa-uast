@@ -24,3 +24,7 @@ export class Parser {
 }
 
 export { cParser };
+export { parseWithParser, initLanguage, internals } from './parser';
+export type { NodeHandler, ParseOptions } from './parser';
+export { MacroEnvironment } from './macros';
+export type { PreprocessorConfig } from './macros';

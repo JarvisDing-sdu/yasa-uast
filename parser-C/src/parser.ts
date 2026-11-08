@@ -40,6 +40,28 @@ function getParser(): TreeSitter.Parser {
     return parserInstance;
 }
 
+/**
+ * A separate tree-sitter parser for another grammar (for example C++), for use
+ * with `parseWithParser`. The C parser used by `parse` is not affected.
+ */
+export async function initLanguage(wasmPath: string): Promise<TreeSitter.Parser> {
+    await init();
+    const parser = new TreeSitter.Parser();
+    parser.setLanguage(await TreeSitter.Language.load(wasmPath));
+    return parser;
+}
+
+/**
+ * Handles one tree-sitter node type in place of the default C visitor. `next`
+ * is the default visitor for the same node; recursion through `visit` keeps
+ * consulting the extensions.
+ */
+export type NodeHandler = (
+    node: SyntaxNode,
+    opts: Record<string, any>,
+    next: (node: SyntaxNode, opts: Record<string, any>) => any,
+) => any;
+
 function toSourceLocation(node: SyntaxNode, sourcefile?: string) {
     return {
         start: {
@@ -739,7 +761,7 @@ const RECOVERABLE = /(_statement|_definition|^declaration|^preproc_(if|ifdef|eli
 function expandMacro(macro: MacroDefinition, text: string, useSite: SyntaxNode, opts: Record<string, any>): any {
     const expanding: Set<string> = opts.__expanding ?? new Set();
     if (expanding.size >= MACRO_DEPTH_LIMIT) return null;
-    const tree = getParser().parse(`void __yasa_macro__(void) {\n${text}\n;}`);
+    const tree = ((opts.__tsParser as TreeSitter.Parser | undefined) ?? getParser()).parse(`void __yasa_macro__(void) {\n${text}\n;}`);
     if (!tree) return null;
     try {
         const root = tree.rootNode;
@@ -813,6 +835,13 @@ function switchCases(body: SyntaxNode, opts: Record<string, any>): UAST.CaseClau
 
 function visit(node: SyntaxNode | null | undefined, opts: Record<string, any>): any {
     if (!node) return null;
+    const handler: NodeHandler | undefined = opts?.__extensions?.[node.type];
+    if (handler) return handler(node, opts, visitDefault);
+    return visitDefault(node, opts);
+}
+
+function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, any>): any {
+    if (!node) return null;
 
     const sourcefile = opts?.sourcefile as string | undefined;
 
@@ -823,8 +852,8 @@ function visit(node: SyntaxNode | null | undefined, opts: Record<string, any>): 
             // language 字段只接受 'javascript'|'typescript'|'java'|'golang'|'python'|'php'，
             // 不认 'c'。因此先传合法值通过运行时校验，再手动修正为 'c'。
             // 待上游 uast-spec 将 'c' 加入合法语言枚举后可移除此 workaround。
-            const compileUnit = UAST.compileUnit(body, 'php' as any, 'c11', sourcefile || '', version);
-            (compileUnit as any).language = 'c';
+            const compileUnit = UAST.compileUnit(body, 'php' as any, opts?.__languageVersion ?? 'c11', sourcefile || '', version);
+            (compileUnit as any).language = opts?.__language ?? 'c';
             return appendNodeMeta(compileUnit, node, sourcefile);
         }
 
@@ -1230,11 +1259,29 @@ function collectParseErrors(root: SyntaxNode): ParseError[] {
  * Pass `{ strict: true }` to throw a SyntaxError instead.
  */
 export function parse(content: string, opts: Record<string, any> = {}): UAST.Node {
+    return parseWithParser(getParser(), content, opts);
+}
+
+/** Options of `parseWithParser` in addition to those of `parse`. */
+export interface ParseOptions extends Record<string, any> {
+    /** Node handlers that replace the default visitor for their node types. */
+    extensions?: Record<string, NodeHandler>;
+    /** `CompileUnit.language`, default `'c'`. */
+    language?: string;
+    /** `CompileUnit.languageVersion`, default `'c11'`. */
+    languageVersion?: string;
+}
+
+/**
+ * `parse` with a given tree-sitter parser (see `initLanguage`), which is also
+ * used to re-parse macro replacements.
+ */
+export function parseWithParser(tsParser: TreeSitter.Parser, content: string, opts: ParseOptions = {}): UAST.Node {
     const source = content.replace(/^\uFEFF/, '');
     const config: PreprocessorConfig = opts.preprocessor ?? {};
     const env = new MacroEnvironment(source, config, opts.sourcefile);
     // Lines of branches the configuration excludes are blanked, so the tree only holds code that may be compiled.
-    const tree = getParser().parse(env.activeSource());
+    const tree = tsParser.parse(env.activeSource());
     if (!tree) throw new Error('tree-sitter failed to parse the C source');
     try {
         const root = tree.rootNode;
@@ -1249,6 +1296,10 @@ export function parse(content: string, opts: Record<string, any> = {}): UAST.Nod
             __unionTypes: new Set<string>(),
             __unionVars: new Set<string>(),
             __macroEnv: env,
+            __tsParser: tsParser,
+            __extensions: opts.extensions,
+            __language: opts.language,
+            __languageVersion: opts.languageVersion,
         });
         unit._meta.parseErrors = errors;
         unit._meta.includes = env.includes;
@@ -1257,3 +1308,18 @@ export function parse(content: string, opts: Record<string, any> = {}): UAST.Nod
         tree.delete();
     }
 }
+
+/** Building blocks of the C visitor, for language packages that extend it. */
+export const internals = {
+    visit,
+    visitStatements,
+    flattenInstructions,
+    appendNodeMeta,
+    cIdentifier,
+    expressionOrNoop,
+    namedChild,
+    mapTypeSpecifier,
+    applyDeclaratorType,
+    createFunction,
+    createDeclaration,
+};
