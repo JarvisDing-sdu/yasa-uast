@@ -3,6 +3,100 @@ import * as assert from 'assert';
 import { Parser } from '../src';
 import { Parser as CParser } from '@ant-yasa/uast-parser-c';
 
+describe('parser-CPP preprocessed input', () => {
+    const parser = new Parser({ sourcefile: 'prepared.cpp', languageVersion: 'c++20', preprocessor: { defines: { VALUE: '99' } } });
+    before(async () => { await parser.init(); });
+
+    it('does not expand caller macros or redefine compiler-undefined platform identifiers', () => {
+        const ast: any = parser.parsePreprocessed('#define RUN(a, b, c) replacement(a, b, c)\nint f(int linux, int __cplusplus) { return RUN(VALUE, linux, __cplusplus); }', {
+            expandMacros: true, preprocessor: { defines: { VALUE: '42', RUN: 'replacement' } },
+        });
+        const [call] = collect(ast, n => n.type === 'CallExpression');
+        assert.strictEqual(call.callee.name, 'RUN');
+        assert.deepStrictEqual(call.arguments.map((n: any) => n.name), ['VALUE', 'linux', '__cplusplus']);
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+        assert.deepStrictEqual(collect(ast, n => !!n._meta?.macro), []);
+    });
+
+    it('skips branch selection and source macro definitions', () => {
+        const ast = parser.parsePreprocessed('#define VALUE 9\n#ifdef __cplusplus\nint one;\n#else\nint two;\n#endif\nint f() { return VALUE; }', {
+            preprocessed: false, preprocessor: { unknownMacros: 'undefined' },
+        });
+        assert.deepStrictEqual(collect(ast, n => n.type === 'VariableDeclaration').map(n => n.id.name), ['one', 'two']);
+        assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement')[0].argument.name, 'VALUE');
+    });
+
+    it('never inspects caller preprocessor overrides', () => {
+        const ast: any = parser.parsePreprocessed('int system(const char *command);', {
+            preprocessor: new Proxy({}, { get() { throw new Error('preprocessor must not be read'); } }),
+        });
+        assert.strictEqual(ast.body[0]._meta.prototype, 'system');
+        assert.deepStrictEqual(ast._meta.includes, []);
+    });
+
+    it('preserves namespace, qualified calls, references and raw strings', () => {
+        const ast: any = parser.parsePreprocessed('namespace A::B { void f(int &x) { const char *s = R"tag(a\\nb\nlinux)tag"; std::system(s); } }', { strict: true });
+        const [fn] = collect(ast, n => n.type === 'FunctionDefinition');
+        assert.strictEqual(fn._meta.qualifiedName, 'A::B::f');
+        assert.strictEqual(fn.parameters[0]._meta.reference, 'lvalue');
+        assert.strictEqual(collect(ast, n => n.type === 'VariableDeclaration' && n.id.name === 's')[0].init.value, 'a\\nb\nlinux');
+        const [call] = collect(ast, n => n.type === 'CallExpression');
+        assert.strictEqual(call.callee._meta.qualifier, 'std');
+        assert.strictEqual(call.callee._meta.namespaceContext, 'A::B');
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+    });
+
+    it('preserves caller languageVersion, sourcefile, CRLF positions and defaults', () => {
+        const ast: any = parser.parsePreprocessed('\r\n\r\n  int f() {\r\n    return linux;\r\n  }\r\n', {
+            sourcefile: 'generated/header.ii', languageVersion: 'c++23', strict: true,
+        });
+        assert.strictEqual(ast.language, 'cpp');
+        assert.strictEqual(ast.languageVersion, 'c++23');
+        const [id] = collect(ast, n => n.type === 'Identifier' && n.name === 'linux');
+        assert.deepStrictEqual(id.loc.start, { line: 4, column: 12 });
+        assert.strictEqual(id.loc.sourcefile, 'generated/header.ii');
+        assert.strictEqual((parser.parsePreprocessed('int x;') as any).languageVersion, 'c++20');
+        assert.strictEqual((cpp.parsePreprocessed('int x;') as any).languageVersion, 'c++17');
+    });
+
+    it('preserves strict errors and recovery', () => {
+        const code = 'int broken( { return 0 }';
+        assert.throws(() => parser.parsePreprocessed(code, { strict: true, sourcefile: 'broken.ii' }),
+            (e: any) => e instanceof SyntaxError && e.message.includes('broken.ii:'));
+        assert.ok((parser.parsePreprocessed(code) as any)._meta.parseErrors.length > 0);
+    });
+
+    it('retains extern C blocks and single declarations inside namespaces', () => {
+        const ast: any = parser.parsePreprocessed('namespace N { extern "C" { int f() { return system("x"); } int prototype(); extern int value; } extern "C" int g() { return 2; } extern "C" int single(); int plain() { return 3; } }', { strict: true });
+        assert.deepStrictEqual(collect(ast, n => n.type === 'FunctionDefinition').map(n => n.id.name), ['f', 'g', 'plain']);
+        const [fn] = collect(ast, n => n.type === 'FunctionDefinition' && n.id.name === 'f');
+        assert.strictEqual(fn._meta.qualifiedName, 'N::f');
+        assert.strictEqual(fn._meta.lexicalLanguageLinkage, 'C');
+        assert.strictEqual(fn._meta.languageLinkageExplicit, true);
+        assert.strictEqual(fn._meta.languageLinkage, undefined);
+        const declarations = collect(ast, n => n._meta?.prototype || (n.type === 'VariableDeclaration' && n.id.name === 'value'));
+        assert.deepStrictEqual(declarations.map(n => n._meta.prototype ?? n.id.name), ['prototype', 'value', 'single']);
+        for (const decl of declarations) {
+            assert.strictEqual(decl._meta.lexicalLanguageLinkage, 'C');
+            assert.strictEqual(decl._meta.namespace, 'N');
+        }
+        assert.strictEqual(collect(ast, n => n.type === 'CallExpression')[0].callee.name, 'system');
+    });
+
+    it('restores lexical linkage after nested specifications and does not leak to raw parse', () => {
+        const code = 'extern "C" { int a(); extern "C++" { int b(); } int c(); } int d();';
+        const before = JSON.stringify(parser.parse(code));
+        const ast = parser.parsePreprocessed(code, { strict: true });
+        const declarations = collect(ast, n => !!n._meta?.prototype);
+        assert.deepStrictEqual(declarations.map(n => [n._meta.prototype, n._meta.lexicalLanguageLinkage, n._meta.languageLinkageExplicit]), [
+            ['a', 'C', true], ['b', 'C++', true], ['c', 'C', true], ['d', 'C++', false],
+        ]);
+        assert.strictEqual(JSON.stringify(parser.parse(code)), before);
+        assert.strictEqual(collect(parser.parse('int f() { return VALUE; }'), n => n.type === 'ReturnStatement')[0].argument.value, 99);
+        assert.strictEqual(collect(parser.parsePreprocessed('int f() { return VALUE; }'), n => n.type === 'ReturnStatement')[0].argument.name, 'VALUE');
+    });
+});
+
 const cpp = new Parser({ sourcefile: 't.cpp' });
 const c = new CParser({ sourcefile: 't.cpp' });
 

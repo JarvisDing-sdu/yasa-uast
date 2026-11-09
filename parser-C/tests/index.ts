@@ -6,6 +6,76 @@ import { init, parse, parseWithParser, initLanguage } from '../src/parser';
 import { Parser } from '../src';
 import { MacroEnvironment } from '../src/macros';
 
+describe('parser-C preprocessed input', () => {
+    const parser = new Parser({ sourcefile: 'prepared.c', preprocessor: { defines: { VALUE: '99' } } });
+    before(async () => { await parser.init(); });
+
+    it('does not expand caller object or function macros a second time', () => {
+        const ast = parser.parsePreprocessed('#define RUN(x) replacement(x)\nint f(void) { return RUN(VALUE); }', {
+            expandMacros: true,
+            preprocessor: { defines: { VALUE: '42', RUN: 'replacement' } },
+        });
+        const [call] = collect(ast, n => n.type === 'CallExpression');
+        assert.strictEqual(call.callee.name, 'RUN');
+        assert.strictEqual(call.arguments[0].name, 'VALUE');
+        assert.deepStrictEqual(collect(ast, n => !!n._meta?.macro), []);
+    });
+
+    it('keeps libc parameter identifiers after the compiler undefines platform macros', () => {
+        const ast: any = parser.parsePreprocessed('int f(int linux, int unix, int __GNUC__) { return linux + unix + __GNUC__; }');
+        const [ret] = collect(ast, n => n.type === 'ReturnStatement');
+        assert.deepStrictEqual(collect(ret, n => n.type === 'Identifier').map(n => n.name), ['linux', 'unix', '__GNUC__']);
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+    });
+
+    it('bypasses branch selection and definitions even with residual directives', () => {
+        const ast: any = parser.parsePreprocessed('#define VALUE 9\n#if 0\nint kept;\n#else\nint also_kept;\n#endif\nint f(void) { return VALUE; }', {
+            preprocessed: false, preprocessor: { unknownMacros: 'undefined' },
+        });
+        assert.deepStrictEqual(collect(ast, n => n.type === 'VariableDeclaration').map(n => n.id.name), ['kept', 'also_kept']);
+        assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement')[0].argument.name, 'VALUE');
+    });
+
+    it('never inspects caller preprocessing configuration or resolves includes', () => {
+        const ast: any = parser.parsePreprocessed('int system(const char *command);\nint f(void) { return 0; }', {
+            preprocessor: new Proxy({}, { get() { throw new Error('preprocessor must not be read'); } }),
+        });
+        assert.strictEqual(ast.body[0]._meta.prototype, 'system');
+        assert.strictEqual(ast.body[1].id.name, 'f');
+        assert.deepStrictEqual(ast._meta.includes, []);
+    });
+
+    it('preserves compiler output newlines, columns, sourcefile and languageVersion', () => {
+        const ast: any = parser.parsePreprocessed('\r\n\r\n  int f(void) {\r\n    return linux;\r\n  }\r\n', {
+            sourcefile: 'generated/header.i', languageVersion: 'c23', strict: true,
+        });
+        assert.strictEqual(ast.language, 'c');
+        assert.strictEqual(ast.languageVersion, 'c23');
+        const [id] = collect(ast, n => n.type === 'Identifier' && n.name === 'linux');
+        assert.deepStrictEqual(id.loc.start, { line: 4, column: 12 });
+        assert.strictEqual(id.loc.sourcefile, 'generated/header.i');
+        assert.strictEqual(ast.loc.sourcefile, 'generated/header.i');
+    });
+
+    it('preserves strict errors and normal recovery', () => {
+        const code = 'int broken( { return 0 }';
+        assert.throws(() => parser.parsePreprocessed(code, { strict: true, sourcefile: 'broken.i' }),
+            (e: any) => e instanceof SyntaxError && e.message.includes('broken.i:'));
+        assert.ok((parser.parsePreprocessed(code) as any)._meta.parseErrors.length > 0);
+    });
+
+    it('reuses visitors and leaves raw parsing and later calls independent', () => {
+        const seen: string[] = [];
+        const ast: any = parser.parsePreprocessed('int f(void) { return VALUE; }', {
+            extensions: { identifier: (node: any, opts: any, next: any) => { seen.push(node.text); return next(node, opts); } },
+        });
+        assert.ok(seen.includes('VALUE'));
+        assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement')[0].argument.name, 'VALUE');
+        assert.strictEqual(collect(parser.parse('int f(void) { return VALUE; }'), n => n.type === 'ReturnStatement')[0].argument.value, 99);
+        assert.strictEqual(collect(parser.parsePreprocessed('int f(void) { return VALUE; }'), n => n.type === 'ReturnStatement')[0].argument.name, 'VALUE');
+    });
+});
+
 const unit = (code: string, opts: Record<string, any> = {}): any => parse(code, { sourcefile: 't.c', ...opts });
 const body = (code: string): any[] => unit(code).body;
 const fnBody = (code: string): any[] => body(code).find((n) => n.type === 'FunctionDefinition').body.body;

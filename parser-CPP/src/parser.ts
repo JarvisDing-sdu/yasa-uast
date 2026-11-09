@@ -1,6 +1,7 @@
 import type * as UAST from '@ant-yasa/uast-spec';
 import { initLanguage, parseWithParser } from '@ant-yasa/uast-parser-c';
 import { cppHandlers } from './handlers';
+import { preprocessedHandlers } from './handlers/linkage';
 
 type TreeSitterParser = Awaited<ReturnType<typeof initLanguage>>;
 
@@ -37,5 +38,20 @@ export function parse(content: string, opts: Record<string, any> = {}): UAST.Nod
         languageVersion: 'c++17',
         extensions: cppHandlers,
         preprocessor: { ...preprocessor, defines: { __cplusplus: CPLUSPLUS, ...preprocessor.defines } },
+    });
+}
+
+/**
+ * Parse compiler output with line directives already removed. Keep C++
+ * visitors, but never add __cplusplus or run any preprocessing again.
+ */
+export function parsePreprocessed(content: string, opts: Record<string, unknown> = {}): UAST.Node {
+    if (!cppParser) throw new Error('Parser not initialized. Call init() first.');
+    return parseWithParser(cppParser, content, {
+        ...opts,
+        language: 'cpp',
+        languageVersion: (opts.languageVersion as string | undefined) ?? 'c++17',
+        extensions: preprocessedHandlers,
+        preprocessed: true,
     });
 }
