@@ -21,6 +21,11 @@ export class Parser {
     parse(content: string, opts: Record<string, any> = {}): UAST.Node {
         return cppParser.parse(content, { ...this.opts, ...opts });
     }
+
+    /** Parse compiler output with line directives already removed, without preprocessing. */
+    parsePreprocessed(content: string, opts: Record<string, unknown> = {}): UAST.Node {
+        return cppParser.parsePreprocessed(content, { ...this.opts, ...opts });
+    }
 }
 
 export { cppParser };

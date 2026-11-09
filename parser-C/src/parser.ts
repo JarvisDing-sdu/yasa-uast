@@ -1,7 +1,7 @@
 import * as TreeSitter from 'web-tree-sitter';
 import * as UAST from '@ant-yasa/uast-spec';
 import { version } from '../package.json';
-import { MacroEnvironment, substitute, MacroDefinition, PreprocessorConfig } from './macros';
+import { MacroEnvironment, substitute, MacroDefinition } from './macros';
 
 type SyntaxNode = TreeSitter.Node;
 
@@ -1262,6 +1262,15 @@ export function parse(content: string, opts: Record<string, any> = {}): UAST.Nod
     return parseWithParser(getParser(), content, opts);
 }
 
+/**
+ * Parse compiler-preprocessed text whose line directives were removed by the
+ * caller. No branch selection, macro expansion or include resolution runs.
+ * Locations refer to this text; source mapping remains the caller's job.
+ */
+export function parsePreprocessed(content: string, opts: Record<string, unknown> = {}): UAST.Node {
+    return parseWithParser(getParser(), content, { ...opts, preprocessed: true });
+}
+
 /** Options of `parseWithParser` in addition to those of `parse`. */
 export interface ParseOptions extends Record<string, any> {
     /** Node handlers that replace the default visitor for their node types. */
@@ -1270,6 +1279,8 @@ export interface ParseOptions extends Record<string, any> {
     language?: string;
     /** `CompileUnit.languageVersion`, default `'c11'`. */
     languageVersion?: string;
+    /** Input is already preprocessed; ignore all preprocessor/expansion options. */
+    preprocessed?: boolean;
 }
 
 /**
@@ -1278,10 +1289,10 @@ export interface ParseOptions extends Record<string, any> {
  */
 export function parseWithParser(tsParser: TreeSitter.Parser, content: string, opts: ParseOptions = {}): UAST.Node {
     const source = content.replace(/^\uFEFF/, '');
-    const config: PreprocessorConfig = opts.preprocessor ?? {};
-    const env = new MacroEnvironment(source, config, opts.sourcefile);
+    const env = opts.preprocessed ? undefined
+        : new MacroEnvironment(source, opts.preprocessor ?? {}, opts.sourcefile);
     // Lines of branches the configuration excludes are blanked, so the tree only holds code that may be compiled.
-    const tree = tsParser.parse(env.activeSource());
+    const tree = tsParser.parse(env ? env.activeSource() : source);
     if (!tree) throw new Error('tree-sitter failed to parse the C source');
     try {
         const root = tree.rootNode;
@@ -1302,7 +1313,7 @@ export function parseWithParser(tsParser: TreeSitter.Parser, content: string, op
             __languageVersion: opts.languageVersion,
         });
         unit._meta.parseErrors = errors;
-        unit._meta.includes = env.includes;
+        unit._meta.includes = env?.includes ?? [];
         return unit;
     } finally {
         tree.delete();
