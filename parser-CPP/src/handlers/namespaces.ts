@@ -13,11 +13,12 @@ const DEFINITIONS = new Set(['FunctionDefinition', 'VariableDeclaration', 'Class
  */
 function markMembers(items: any[], namespace: string, anonymous: boolean): void {
     for (const item of flatten(items)) {
-        if (!DEFINITIONS.has(item.type) || !item._meta) continue;
+        if (!item._meta || (!DEFINITIONS.has(item.type) && !item._meta.prototype)) continue;
         if (anonymous) item._meta.anonymousNamespace = true;
         if (!namespace || item._meta.namespace !== undefined) continue;
         item._meta.namespace = namespace;
-        if (item.id?.name) item._meta.qualifiedName = joinScope(namespace, item.id.name);
+        const name = item.id?.name ?? item._meta.prototype;
+        if (name) item._meta.qualifiedName = joinScope(namespace, name);
     }
 }
 

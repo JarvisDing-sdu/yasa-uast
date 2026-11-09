@@ -66,6 +66,13 @@ describe('parser-CPP', () => {
         const fns = (code: string) => collect(cpp.parse(code), (n) => n.type === 'FunctionDefinition');
         const calls = (code: string) => collect(cpp.parse(code), (n) => n.type === 'CallExpression');
 
+        it('retains namespace ownership on function prototypes', () => {
+            const unit: any = cpp.parse('namespace X { namespace std { int system(const char *); } }');
+            const [prototype] = collect(unit, (n) => n._meta?.prototype === 'system');
+            assert.strictEqual(prototype._meta.namespace, 'X::std');
+            assert.strictEqual(prototype._meta.qualifiedName, 'X::std::system');
+        });
+
         it('encodes functions inside nested namespaces', () => {
             const unit: any = cpp.parse('namespace A { namespace B { int f(void) { return 1; } int g; } }\nnamespace C::D { void h() {} }\nint top(void) { return 0; }');
             const byName = Object.fromEntries(collect(unit, (n) => n.type === 'FunctionDefinition').map((f) => [f.id.name, f._meta]));
