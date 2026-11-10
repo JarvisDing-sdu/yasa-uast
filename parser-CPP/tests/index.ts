@@ -130,6 +130,20 @@ describe('parser-CPP', () => {
     });
 
     describe('compile unit', () => {
+        for (const [name, code] of [
+            ['arithmetic and return', 'int add(int a, int b) { return a + b; }'],
+            ['pointer read and write', 'void set(int *p) { *p = 3; }'],
+            ['array indexing', 'int get(int *a, int i) { return a[i]; }'],
+            ['loop and conditional', 'int f(int n) { int s = 0; for (int i = 0; i < n; i++) { if (i > 1) s += i; } return s; }'],
+            ['structure member access', 'struct S { int n; }; int f(struct S *p) { return p->n; }'],
+            ['function pointer call', 'int apply(int (*fn)(int), int x) { return fn(x); }'],
+        ]) {
+            it(`matches C UAST for common syntax: ${name}`, () => {
+                const cAst: any = c.parse(code, { strict: true });
+                const cppAst: any = cpp.parse(code, { strict: true });
+                assert.deepStrictEqual(comparable(cppAst), comparable(cAst));
+            });
+        }
         it('parses the C subset like parser-C', () => {
             const code = [
                 'struct S { char *p; int n; };',
@@ -221,6 +235,22 @@ describe('parser-CPP', () => {
 
     describe('statements and expressions', () => {
         const fnBody = (code: string): any[] => collect(cpp.parse(code), (n) => n.type === 'FunctionDefinition')[0].body.body;
+
+        it('preserves nested and expression subscript indices', () => {
+            const ast = cpp.parse('int f(int **a, int i) { return a[i + 1][0]; }', { strict: true });
+            const [outer, inner] = collect(ast, n => n.type === 'MemberAccess' && n.computed);
+            assert.strictEqual(outer.property.value, 0);
+            assert.strictEqual(inner.property.type, 'BinaryExpression');
+            assert.strictEqual(inner.property.left.name, 'i');
+            assert.strictEqual(inner.property.right.value, 1);
+        });
+
+        it('preserves all arguments of a C++23 multidimensional subscript', () => {
+            const ast = cpp.parse('int f(A a, int i, int j) { return a[i, j]; }', { strict: true });
+            const [access] = collect(ast, n => n.type === 'MemberAccess' && n.computed);
+            assert.strictEqual(access.property.type, 'TupleExpression');
+            assert.deepStrictEqual(access.property.elements.map((n: any) => n.name), ['i', 'j']);
+        });
 
         it('maps condition_clause with and without init statement', () => {
             const [plain] = fnBody('void f(int x) { if (x) g(); }');

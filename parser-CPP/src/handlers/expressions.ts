@@ -62,8 +62,21 @@ const rawString: NodeHandler = (node, opts) => {
     return internals.appendNodeMeta(UAST.literal(content?.text ?? '', 'string'), node, opts.sourcefile);
 };
 
+/** C++ grammar wraps subscript arguments in an indices list. */
+const subscriptExpression: NodeHandler = (node, opts, next) => {
+    const indices = node.childForFieldName('indices');
+    if (!indices) return next(node, opts);
+    const args = indices.namedChildren.filter((child: any) => child.type !== 'comment');
+    const object = internals.expressionOrNoop(node.childForFieldName('argument'), opts);
+    const index = args.length === 1
+        ? internals.expressionOrNoop(args[0], opts)
+        : internals.appendNodeMeta(UAST.tupleExpression(args.map((arg: any) => internals.expressionOrNoop(arg, opts))), indices, opts.sourcefile);
+    return internals.appendNodeMeta(UAST.memberAccess(object, index, true), node, opts.sourcefile);
+};
+
 export const expressionHandlers: Record<string, NodeHandler> = {
     raw_string_literal: rawString,
+    subscript_expression: subscriptExpression,
     call_expression: callExpression,
     condition_clause: conditionClause,
     if_statement: withConditionDeclarations,
