@@ -10,6 +10,17 @@ describe('parser-C preprocessed input', () => {
     const parser = new Parser({ sourcefile: 'prepared.c', preprocessor: { defines: { VALUE: '99' } } });
     before(async () => { await parser.init(); });
 
+    it('preserves named and unnamed bitfields, widths and initializer positions', () => {
+        const ast: any = parser.parsePreprocessed('struct S { unsigned :3, field:2, :0; int tail; }; struct S x = { 7, 8 };', { strict: true });
+        const struct = ast.body[0];
+        assert.deepStrictEqual(struct.body.map((n: any) => n._meta.bitfield?.width?.value ?? n.id?.name), [3, 2, 0, 'tail']);
+        assert.strictEqual(struct.body[0]._meta.bitfield.unnamed, true);
+        assert.strictEqual(struct.body[1].id.name, 'field');
+        assert.strictEqual(struct.body[2]._meta.bitfield.unnamed, true);
+        assert.deepStrictEqual(ast.body[1].init.properties.map((p: any) => p.key.name), ['field', 'tail']);
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+    });
+
     it('accepts GCC signed type spelling without modifying literals or offsets', () => {
         const ast: any = parser.parsePreprocessed('typedef __signed__ char s8;\nconst char *s = "__signed__";\n', { strict: true });
         assert.deepStrictEqual(ast._meta.parseErrors, []);

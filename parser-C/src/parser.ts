@@ -20,7 +20,7 @@ export function init(): Promise<void> {
         initialization = (async () => {
             await TreeSitter.Parser.init();
             const Lang = await TreeSitter.Language.load(
-                require.resolve('tree-sitter-c/tree-sitter-c.wasm')
+                require.resolve('../grammar/tree-sitter-c.wasm')
             );
             const parser = new TreeSitter.Parser();
             parser.setLanguage(Lang);
@@ -357,7 +357,7 @@ function createDeclaration(node: SyntaxNode, opts: Record<string, any>): any {
     const declarators = node.childrenForFieldName('declarator');
     const storage = storageClasses(node);
 
-    if (declarators.length === 0) {
+    if (declarators.length === 0 && !node.namedChildren.some(child => child.type === 'bitfield_clause')) {
         return typeOnlyDefinition || appendNodeMeta(UAST.noop(), node, sourcefile);
     }
 
@@ -385,7 +385,30 @@ function createDeclaration(node: SyntaxNode, opts: Record<string, any>): any {
         return appendNodeMeta(varDecl, declNode, sourcefile);
     });
 
-    const all = typeOnlyDefinition ? [typeOnlyDefinition, ...declarations] : declarations;
+    // A bitfield clause follows its declarator; a clause without a declarator
+    // is an unnamed padding field and must not become an initializable member.
+    let members = declarations;
+    if (node.type === 'field_declaration' && node.namedChildren.some(child => child.type === 'bitfield_clause')) {
+        members = [];
+        let pending: any = null;
+        for (const child of node.children) {
+            const index = declarators.findIndex(decl => decl.startIndex === child.startIndex && decl.endIndex === child.endIndex);
+            if (index !== -1) {
+                pending = declarations[index];
+                members.push(pending);
+            } else if (child.type === 'bitfield_clause') {
+                const widthNode = child.namedChildren[0];
+                const width = widthNode ? visit(widthNode, opts) : null;
+                if (pending) pending._meta.bitfield = { width };
+                else {
+                    const padding = appendNodeMeta(UAST.noop(), child, sourcefile);
+                    padding._meta.bitfield = { unnamed: true, width, type: mapTypeSpecifier(typeNode, opts) };
+                    members.push(padding);
+                }
+            } else if (child.type === ',') pending = null;
+        }
+    }
+    const all = typeOnlyDefinition ? [typeOnlyDefinition, ...members] : members;
     if (all.length === 1) return all[0];
     return appendNodeMeta(UAST.sequence(all), node, sourcefile);
 }
