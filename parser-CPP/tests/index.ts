@@ -7,6 +7,12 @@ describe('parser-CPP preprocessed input', () => {
     const parser = new Parser({ sourcefile: 'prepared.cpp', languageVersion: 'c++20', preprocessor: { defines: { VALUE: '99' } } });
     before(async () => { await parser.init(); });
 
+    it('accepts GCC signed type spelling without changing C++ raw strings', () => {
+        const ast: any = parser.parsePreprocessed('typedef __signed__ char s8;\nconst char *s = R"tag(\"__signed__\")tag";', { strict: true });
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+        assert.strictEqual(collect(ast, n => n.type === 'VariableDeclaration')[0].init.value, '"__signed__"');
+    });
+
     it('does not expand caller macros or redefine compiler-undefined platform identifiers', () => {
         const ast: any = parser.parsePreprocessed('#define RUN(a, b, c) replacement(a, b, c)\nint f(int linux, int __cplusplus) { return RUN(VALUE, linux, __cplusplus); }', {
             expandMacros: true, preprocessor: { defines: { VALUE: '42', RUN: 'replacement' } },
@@ -293,6 +299,63 @@ describe('parser-CPP', () => {
             assert.ok(names.includes('a') && names.includes('b'), names.join(','));
             assert.ok(unit._meta.parseErrors.length > 0);
         });
+    });
+
+    it('preserves a function template and its body without inventing specializations', () => {
+        const ast = cpp.parse('namespace N { template <typename T> T twice(T x) { return x + x; } }', { strict: true });
+        const [fn] = collect(ast, n => n.type === 'FunctionDefinition');
+        assert.strictEqual(fn.id.name, 'twice');
+        assert.strictEqual(fn._meta.qualifiedName, 'N::twice');
+        assert.strictEqual(fn._meta.cppTemplate.parameters, '<typename T>');
+        assert.strictEqual(collect(fn, n => n.type === 'ReturnStatement').length, 1);
+    });
+
+    it('keeps unsupported template specializations explicit instead of misnaming them', () => {
+        const ast = cpp.parse('template <> int twice<int>(int x) { return x; }', { strict: true });
+        assert.strictEqual(collect(ast, n => n.type === 'FunctionDefinition').length, 0);
+        assert.strictEqual(collect(ast, n => n._meta?.unhandled?.kind === 'template_declaration').length, 1);
+    });
+
+    it('preserves qualified and member template calls', () => {
+        const ast = cpp.parse('void f() { std::make_shared<Item>(1); object.run<int>(2); }', { strict: true });
+        const [first, second] = collect(ast, n => n.type === 'CallExpression');
+        assert.strictEqual(first.callee.name, 'make_shared');
+        assert.strictEqual(first.callee._meta.qualifier, 'std');
+        assert.strictEqual(first.callee._meta.cppTemplateArguments, '<Item>');
+        assert.strictEqual(second.callee.property.name, 'run');
+        assert.strictEqual(second.callee.property._meta.cppTemplateArguments, '<int>');
+    });
+
+    it('preserves the this expression in an out-of-class member definition', () => {
+        const ast = cpp.parse('void A::set(int value) { this->value = value; }', { strict: true });
+        const [member] = collect(ast, n => n.type === 'MemberAccess');
+        assert.strictEqual(member.object.type, 'ThisExpression');
+        assert.strictEqual(member.property.name, 'value');
+        assert.strictEqual(member._meta.operator, '->');
+    });
+
+    it('records simple using type aliases and pointer targets', () => {
+        const ast = cpp.parse('using Index = int; using Ptr = int *;', { strict: true });
+        const aliases = collect(ast, n => !!n._meta?.typedef).map(n => n._meta.typedef);
+        assert.deepStrictEqual(aliases.map((n: any) => n.name), ['Index', 'Ptr']);
+        assert.strictEqual(aliases[0].type.type, 'PrimitiveType');
+        assert.strictEqual(aliases[1].type.type, 'PointerType');
+    });
+
+    it('keeps namespace context for a using type alias', () => {
+        const ast = cpp.parse('namespace N { using Index = int; }', { strict: true });
+        const [alias] = collect(ast, n => n._meta?.typedef?.name === 'Index');
+        assert.strictEqual(alias._meta.namespace, 'N');
+    });
+
+    it('preserves a directive-looking line and comment text inside a raw string', () => {
+        const code = 'const char *s = R"tag(\n#define VALUE /* keep */ 1\n)tag";\nint f() { return VALUE; }';
+        const ast = cpp.parse(code, { strict: true });
+        const [decl] = collect(ast, n => n.type === 'VariableDeclaration');
+        assert.strictEqual(decl.init.value, '\n#define VALUE /* keep */ 1\n');
+        const [ret] = collect(ast, n => n.type === 'ReturnStatement');
+        assert.strictEqual(ret.argument.type, 'Identifier');
+        assert.strictEqual(ret.argument.name, 'VALUE');
     });
 });
 

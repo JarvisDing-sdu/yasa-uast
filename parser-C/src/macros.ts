@@ -93,6 +93,16 @@ interface Line {
 const INCLUDE_DEPTH_LIMIT = 32;
 const DIRECTIVE = /^\s*#\s*([A-Za-z_]\w*)?(.*)$/s;
 
+/** Raw strings may span lines that look like preprocessing directives. */
+function rawStringRanges(text: string): Array<[number, number]> {
+    const ranges: Array<[number, number]> = [];
+    const tokens = /\/\*[\s\S]*?\*\/|\/\/(?:\\\r?\n|[^\n])*|(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\([\s\S]*?\)\1"|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'/g;
+    for (const match of text.matchAll(tokens)) {
+        if (/^(?:u8|u|U|L)?R"/.test(match[0])) ranges.push([match.index!, match.index! + match[0].length]);
+    }
+    return ranges;
+}
+
 function sameValue(a: MacroValue | undefined, b: MacroValue | undefined): boolean {
     if (a === b) return true;
     if (!a || !b || a.length !== b.length) return false;
@@ -114,12 +124,24 @@ function stripComments(text: string): string {
         if (c === '/' && text[i + 1] === '*') {
             const end = text.indexOf('*/', i + 2);
             const stop = end < 0 ? text.length : end + 2;
-            for (let j = i; j < stop; j++) if (out[j] !== '\n' && out[j] !== '\r') out[j] = ' ';
+            for (let j = i; j < stop; j++) {
+                if (out[j] === '\n' || out[j] === '\r') continue;
+                // Physical line splicing happens before comments are removed.
+                if (out[j] === '\\' && (text[j + 1] === '\n' || (text[j + 1] === '\r' && text[j + 2] === '\n'))) continue;
+                out[j] = ' ';
+            }
             i = stop;
         } else if (c === '/' && text[i + 1] === '/') {
-            while (i < text.length && text[i] !== '\n') {
-                if (text[i] === '\\' && text[i + 1] === '\n') break;
-                out[i++] = ' ';
+            while (i < text.length) {
+                if (text[i] === '\\' && (text[i + 1] === '\n' || (text[i + 1] === '\r' && text[i + 2] === '\n'))) {
+                    out[i++] = ' ';
+                    if (text[i] === '\r') i++;
+                    i++;
+                    continue;
+                }
+                if (text[i] === '\n') break;
+                if (text[i] !== '\r') out[i] = ' ';
+                i++;
             }
         } else if (c === '"' || c === '\'') {
             i++;
@@ -241,11 +263,15 @@ export class MacroEnvironment {
     private frames: GroupFrame[] = [];
     private activity = new Map<number, BranchActivity>();
     private includeStack: string[] = [];
+    private readonly activeIncludes = new Set<string>();
+    private readonly onceFiles = new Set<string>();
+    private definiteIncludeContext = true;
     /** Offset at which events from an included header take effect (the #include). */
     private includeOffset: number | null = null;
     private readonly unseen: MacroValue;
     private inactiveRanges: Array<[number, number]> = [];
     private resolvedDirectiveRanges: Array<[number, number]> = [];
+    private readonly includedFiles = new Set<string>();
     /** Headers read through `#include`, in inclusion order. */
     readonly includes: string[] = [];
 
@@ -260,7 +286,10 @@ export class MacroEnvironment {
         for (const name of platform.undefined) if (!(name in predefined)) this.set(name, [null], -1);
         for (const [name, body] of Object.entries(predefined)) this.set(name, [{ name, params: null, variadic: false, body }], -1);
         for (const name of config.undefines ?? []) this.set(name, [null], -1);
-        if (sourcefile) this.includeStack.push(sourcefile);
+        if (sourcefile) {
+            this.includeStack.push(sourcefile);
+            this.activeIncludes.add(sourcefile);
+        }
         this.scan(source, true);
     }
 
@@ -272,10 +301,37 @@ export class MacroEnvironment {
      * Unknown groups retain their directives and their conditional metadata.
      */
     activeSource(): string {
-        if (!this.inactiveRanges.length && !this.resolvedDirectiveRanges.length) return this.source;
         const out = this.source.split('');
         for (const [start, end] of [...this.inactiveRanges, ...this.resolvedDirectiveRanges]) {
             for (let i = start; i < end && i < out.length; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
+        }
+        // Tree-sitter can terminate a continued #define at a comment inside its
+        // body. C replaces comments before macro expansion; blank them without
+        // changing positions or removing physical line continuations.
+        const uncommented = stripComments(this.source);
+        const rawRanges = rawStringRanges(this.source);
+        let pos = 0;
+        while (pos < this.source.length) {
+            let end = this.source.indexOf('\n', pos);
+            if (end < 0) end = this.source.length;
+            const line = this.source.slice(pos, end).replace(/\r$/, '');
+            if (!rawRanges.some(([start, stop]) => pos >= start && pos < stop) && /^\s*#\s*define\b/.test(uncommented.slice(pos, end))) {
+                let last = end;
+                let current = line;
+                while (current.endsWith('\\') && last < this.source.length) {
+                    const start = last + 1;
+                    last = this.source.indexOf('\n', start);
+                    if (last < 0) last = this.source.length;
+                    current = this.source.slice(start, last).replace(/\r$/, '');
+                }
+                for (let i = pos; i < last; i++) {
+                    if (out[i] !== this.source[i] || uncommented[i] !== ' ' || this.source[i] === ' ') continue;
+                    if (this.source[i] === '\\' && (this.source[i + 1] === '\n' || (this.source[i + 1] === '\r' && this.source[i + 2] === '\n'))) continue;
+                    if (this.source[i] !== '\n' && this.source[i] !== '\r') out[i] = ' ';
+                }
+                end = last;
+            }
+            pos = end + 1;
         }
         return out.join('');
     }
@@ -357,6 +413,7 @@ export class MacroEnvironment {
      */
     private scan(text: string, main: boolean): void {
         const lines = logicalLines(stripComments(text));
+        const rawRanges = rawStringRanges(text);
         const groups: Group[] = [];
         const live = () => groups.every((g) => g.live);
         let inactiveFrom: number | null = null;
@@ -375,6 +432,7 @@ export class MacroEnvironment {
             const directive = m[1] ?? '';
             const rest = m[2] ?? '';
             const hash = line.start + line.text.indexOf('#');
+            if (rawRanges.some(([start, end]) => hash >= start && hash < end)) continue;
             switch (directive) {
                 case 'if':
                 case 'ifdef':
@@ -477,8 +535,15 @@ export class MacroEnvironment {
                     }
                     break;
                 case 'include':
-                    if (live()) this.include(rest.trim(), line.end);
+                    if (live()) this.include(rest.trim(), line.end, groups.every((group) => !group.uncertain));
                     break;
+                case 'pragma': {
+                    const file = this.includeStack[this.includeStack.length - 1];
+                    if (file && this.definiteIncludeContext && /^\s*once\s*$/.test(rest) && live() && groups.every((group) => !group.uncertain)) {
+                        this.onceFiles.add(file);
+                    }
+                    break;
+                }
                 default:
                     break;
             }
@@ -490,23 +555,31 @@ export class MacroEnvironment {
         if (main && this.includeOffset === null) this.activity.set(offset, activity);
     }
 
-    private include(spec: string, offset: number): void {
+    private include(spec: string, offset: number, definite: boolean): void {
         const angled = spec.startsWith('<');
         if (!(angled || spec.startsWith('"')) || !this.config.resolveInclude) return;
         const close = spec.indexOf(angled ? '>' : '"', 1);
         if (close < 0 || this.includeStack.length >= INCLUDE_DEPTH_LIMIT) return;
         const from = this.includeStack[this.includeStack.length - 1];
         const header = this.config.resolveInclude(spec.slice(1, close), from, angled);
-        if (!header || this.includeStack.includes(header.file)) return;
+        if (!header || this.activeIncludes.has(header.file) || this.onceFiles.has(header.file)) return;
         const outerOffset = this.includeOffset;
+        const outerDefinite = this.definiteIncludeContext;
+        this.definiteIncludeContext = outerDefinite && definite;
         this.includeOffset = outerOffset ?? offset;
         this.includeStack.push(header.file);
-        if (!this.includes.includes(header.file)) this.includes.push(header.file);
+        this.activeIncludes.add(header.file);
+        if (!this.includedFiles.has(header.file)) {
+            this.includedFiles.add(header.file);
+            this.includes.push(header.file);
+        }
         try {
             this.scan(header.content, false);
         } finally {
             this.includeStack.pop();
+            this.activeIncludes.delete(header.file);
             this.includeOffset = outerOffset;
+            this.definiteIncludeContext = outerDefinite;
         }
     }
 
@@ -662,5 +735,6 @@ export function substitute(macro: MacroDefinition, args: string[]): string {
         return values.has(ident) ? values.get(ident)! : all;
     });
     // `##` inside string or char literals is text, not the paste operator.
+    if (!replaced.includes('##')) return replaced;
     return replaced.replace(LITERAL_OR_PASTE, (all, literal) => literal ?? '');
 }

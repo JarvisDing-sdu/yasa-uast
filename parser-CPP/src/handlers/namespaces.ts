@@ -41,6 +41,16 @@ const namespaceDefinition: NodeHandler = (node, opts) => {
 /** `A::B::f` in an expression: the name, with its qualifier in `_meta.qualifier`. */
 const qualifiedIdentifier: NodeHandler = (node, opts, next) => {
     const { qualifier, name } = splitQualified(node);
+    if (name?.type === 'template_function') {
+        const base = name.childForFieldName('name');
+        if (!base || base.type !== 'identifier') return next(node, opts);
+        const id = internals.cIdentifier(base.text, node, opts.sourcefile);
+        id._meta.qualifier = qualifier;
+        id._meta.globalQualified = node.text.trimStart().startsWith('::');
+        id._meta.namespaceContext = currentNamespace(opts);
+        id._meta.cppTemplateArguments = name.childForFieldName('arguments')?.text ?? '';
+        return id;
+    }
     if (name?.type !== 'identifier') return next(node, opts);
     const id = internals.cIdentifier(name.text, node, opts.sourcefile);
     id._meta.qualifier = qualifier;

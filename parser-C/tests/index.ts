@@ -10,6 +10,13 @@ describe('parser-C preprocessed input', () => {
     const parser = new Parser({ sourcefile: 'prepared.c', preprocessor: { defines: { VALUE: '99' } } });
     before(async () => { await parser.init(); });
 
+    it('accepts GCC signed type spelling without modifying literals or offsets', () => {
+        const ast: any = parser.parsePreprocessed('typedef __signed__ char s8;\nconst char *s = "__signed__";\n', { strict: true });
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+        assert.strictEqual(collect(ast, n => n.type === 'VariableDeclaration')[0].init.value, '__signed__');
+        assert.strictEqual(collect(ast, n => n.type === 'VariableDeclaration')[0].loc.start.line, 2);
+    });
+
     it('does not expand caller object or function macros a second time', () => {
         const ast = parser.parsePreprocessed('#define RUN(x) replacement(x)\nint f(void) { return RUN(VALUE); }', {
             expandMacros: true,
@@ -108,6 +115,17 @@ describe('parser-C', () => {
     });
 
     describe('compile unit', () => {
+        it('wraps a root-level syntax error in a diagnostic CompileUnit', () => {
+            const code = 'log_do_begin(log_l2)\nlog_do_end(log_l2)\nexpect_d_eq(count, 20, "Mis-logged!");\nTEST_END';
+            const ast = unit(code);
+            assert.strictEqual(ast.type, 'CompileUnit');
+            assert.strictEqual(ast.language, 'c');
+            assert.strictEqual(ast._meta.origin.type, 'ERROR');
+            assert.ok(ast._meta.parseErrors.length > 0);
+            assert.ok(ast._meta.parseErrors.some((e: any) => e.line === 3), 'nested root errors should retain actionable locations');
+            assert.ok(collect(ast, n => n._meta?.syntaxError).length > 0);
+            assert.throws(() => unit(code, { strict: true }), SyntaxError);
+        });
         it('produces a C CompileUnit with includes', () => {
             const ast = unit('#include <stdio.h>\n#include "local.h"\nint x;');
             assert.strictEqual(ast.type, 'CompileUnit');
@@ -451,6 +469,92 @@ void f(char *a, char *b, char *buf) { D("%s %s", a, b); LOG(buf); LOG("%s", buf)
     });
 
     describe('preprocessor semantics', () => {
+        it('respects a previously defined header guard on repeated includes', () => {
+            const code = '#include "guard.h"\n#undef VALUE\n#include "guard.h"\nint f(void) { return VALUE; }';
+            const header = '#ifndef GUARD_H\n#define GUARD_H\n#define VALUE 7\n#endif\n';
+            const ast = unit(code, { preprocessor: { unknownMacros: 'undefined', resolveInclude: () => ({ file: '/guard.h', content: header }) } });
+            const ret = collect(ast, n => n.type === 'ReturnStatement')[0];
+            assert.strictEqual(ret.argument.type, 'Identifier');
+            assert.strictEqual(ret.argument.name, 'VALUE');
+        });
+
+        it('honors pragma once for repeated includes without restoring undefined macros', () => {
+            const code = '#include "once.h"\n#undef VALUE\n#include "once.h"\nint f(void) { return VALUE; }';
+            const header = '#pragma once\n#define VALUE 7\n';
+            const ast = unit(code, { preprocessor: { unknownMacros: 'undefined', resolveInclude: () => ({ file: '/once.h', content: header }) } });
+            const ret = collect(ast, n => n.type === 'ReturnStatement')[0];
+            assert.strictEqual(ret.argument.type, 'Identifier');
+            assert.strictEqual(ret.argument.name, 'VALUE');
+        });
+
+        it('reanalyzes a header first included on an unknown branch', () => {
+            const code = '#ifdef FEATURE\n#include "once.h"\n#endif\n#undef VALUE\n#include "once.h"\nint f(void) { return VALUE; }';
+            const header = '#pragma once\n#define VALUE 7\n';
+            const ast = unit(code, { preprocessor: { unknownMacros: 'cover', resolveInclude: () => ({ file: '/once.h', content: header }) } });
+            const ret = collect(ast, n => n.type === 'ReturnStatement')[0];
+            assert.strictEqual(ret.argument.type, 'Literal');
+            assert.strictEqual(ret.argument.value, 7);
+        });
+
+        it('keeps pragma once state local to each parsed translation unit', () => {
+            const code = '#include "once.h"\nint f(void) { return VALUE; }';
+            const preprocessor = { unknownMacros: 'undefined', resolveInclude: () => ({ file: '/once.h', content: '#pragma once\n#define VALUE 7\n' }) };
+            for (let i = 0; i < 2; i++) {
+                const ast = unit(code, { preprocessor });
+                assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement')[0].argument.value, 7);
+            }
+        });
+
+        it('stops include cycles but allows a later non-guarded include', () => {
+            const headers: Record<string, string> = {
+                '/a.h': '#include "b.h"\n#define VALUE 7\n',
+                '/b.h': '#include "a.h"\n',
+            };
+            const code = '#include "a.h"\n#undef VALUE\n#include "a.h"\nint f(void) { return VALUE; }';
+            const ast = unit(code, { preprocessor: { unknownMacros: 'undefined', resolveInclude: (name: string) => ({ file: `/${name}`, content: headers[`/${name}`] }) } });
+            assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement')[0].argument.value, 7);
+            assert.deepStrictEqual(ast._meta.includes, ['/a.h', '/b.h']);
+        });
+        it('preserves continued macro parsing when its replacement contains comments', () => {
+            const code = '#define F(x) \\\n x##z \\\n /* hello */ \\\n x##b\nint f(void){return 0;}';
+            const ast = unit(code, { strict: true });
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+            assert.strictEqual(collect(ast, n => n.type === 'FunctionDefinition')[0].id.name, 'f');
+            assert.strictEqual(collect(ast, n => n.type === 'FunctionDefinition')[0].loc.start.line, 5);
+        });
+
+        it('keeps comment-like text and continued macro expansion intact', () => {
+            const code = '#define F(x) \\\r\n ((x) + /* annotation */ 1)\r\nconst char *s = "/* literal */";\r\nint f(void) { return F(2); }';
+            const ast = unit(code, { strict: true });
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+            assert.strictEqual(collect(ast, n => n.type === 'VariableDeclaration')[0].init.value, '/* literal */');
+            const ret = collect(ast, n => n.type === 'ReturnStatement')[0];
+            assert.ok(collect(ret, n => n.type === 'Literal' && n.value === 2).length);
+            assert.ok(collect(ret, n => n.type === 'Literal' && n.value === 1).length);
+        });
+
+        it('handles comments within a single-line macro replacement', () => {
+            const ast = unit('#define F(x) x /*comment*/ + 1\nint f(void) { return F(2); }', { strict: true });
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+            const ret = collect(ast, n => n.type === 'ReturnStatement')[0];
+            assert.ok(collect(ret, n => n.type === 'Literal' && n.value === 2).length);
+            assert.ok(collect(ret, n => n.type === 'Literal' && n.value === 1).length);
+        });
+
+        it('keeps a macro definition across a spliced multiline comment', () => {
+            const code = '#define F(x) /* first \\\n second */ \\\n ((x) + 1)\nint f(void) { return F(2); }';
+            const ast = unit(code, { strict: true });
+            const ret = collect(ast, n => n.type === 'ReturnStatement')[0];
+            assert.ok(collect(ret, n => n.type === 'Literal' && n.value === 2).length);
+            assert.ok(collect(ret, n => n.type === 'Literal' && n.value === 1).length);
+        });
+        it('keeps a continued line comment from defining a macro on the next line', () => {
+            const code = '// ignored \\\n#define VALUE 99\nint f(void) { return VALUE; }';
+            const ast = unit(code, { preprocessor: { unknownMacros: 'undefined' } });
+            const ret = collect(ast, n => n.type === 'ReturnStatement')[0];
+            assert.strictEqual(ret.argument.type, 'Identifier');
+            assert.strictEqual(ret.argument.name, 'VALUE');
+        });
         const calls = (code: string, opts: Record<string, any> = {}) =>
             collect(unit(code, opts), (n) => n.type === 'CallExpression').map((c: any) => c.callee.name);
         const sinkArg = (code: string, opts: Record<string, any> = {}): any =>

@@ -1240,7 +1240,10 @@ function collectParseErrors(root: SyntaxNode): ParseError[] {
                 kind: node.isMissing ? 'missing' : 'error',
                 text: node.isMissing ? node.type : node.text.slice(0, 80),
             });
-            descend = false;
+            // A root ERROR can span the whole file. Include its nested errors
+            // so diagnostics identify actionable locations, while keeping the
+            // root error first and avoiding nested duplication elsewhere.
+            descend = node.id === root.id && node.isError;
         }
         if (descend && node.hasError && cursor.gotoFirstChild()) continue;
         if (cursor.gotoNextSibling()) { descend = true; continue; }
@@ -1288,7 +1291,14 @@ export interface ParseOptions extends Record<string, any> {
  * used to re-parse macro replacements.
  */
 export function parseWithParser(tsParser: TreeSitter.Parser, content: string, opts: ParseOptions = {}): UAST.Node {
-    const source = content.replace(/^\uFEFF/, '');
+    let source = content.replace(/^\uFEFF/, '');
+    if (opts.preprocessed) {
+        // GCC system headers use __signed__ as a synonym for signed. The C
+        // grammar does not recognize it as a type specifier. Keep byte/column
+        // offsets unchanged and never rewrite strings, characters or comments.
+        source = source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\([\s\S]*?\)\1"|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\b__signed__\b/g,
+            (token) => token === '__signed__' ? 'signed'.padEnd(token.length, ' ') : token);
+    }
     const env = opts.preprocessed ? undefined
         : new MacroEnvironment(source, opts.preprocessor ?? {}, opts.sourcefile);
     // Lines of branches the configuration excludes are blanked, so the tree only holds code that may be compiled.
@@ -1301,7 +1311,7 @@ export function parseWithParser(tsParser: TreeSitter.Parser, content: string, op
             const first = errors[0];
             throw new SyntaxError(`C syntax error at ${opts.sourcefile ?? '<source>'}:${first.line}:${first.column}`);
         }
-        const unit = visit(root, {
+        const visited = visit(root, {
             ...opts,
             __structs: new Map<string, string[]>(),
             __unionTypes: new Set<string>(),
@@ -1312,6 +1322,15 @@ export function parseWithParser(tsParser: TreeSitter.Parser, content: string, op
             __language: opts.language,
             __languageVersion: opts.languageVersion,
         });
+        // Tree-sitter may return an ERROR as the root. Preserve recovery nodes
+        // and diagnostics while keeping the parser's CompileUnit contract.
+        let unit = visited;
+        if (root.type === 'ERROR') {
+            const body = visited?.type === 'Sequence' ? visited.expressions : visited ? [visited] : [];
+            unit = UAST.compileUnit(body, 'php' as any, opts.languageVersion ?? 'c11', opts.sourcefile || '', version);
+            (unit as any).language = opts.language ?? 'c';
+            appendNodeMeta(unit, root, opts.sourcefile);
+        }
         unit._meta.parseErrors = errors;
         unit._meta.includes = env?.includes ?? [];
         return unit;

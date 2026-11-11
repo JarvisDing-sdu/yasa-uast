@@ -74,9 +74,21 @@ const subscriptExpression: NodeHandler = (node, opts, next) => {
     return internals.appendNodeMeta(UAST.memberAccess(object, index, true), node, opts.sourcefile);
 };
 
+const templateName: NodeHandler = (node, opts, next) => {
+    const name = node.childForFieldName('name');
+    if (!name || !['identifier', 'field_identifier'].includes(name.type)) return next(node, opts);
+    const id = internals.cIdentifier(name.text, node, opts.sourcefile);
+    id._meta.cppTemplateArguments = node.childForFieldName('arguments')?.text ?? '';
+    id._meta.namespaceContext = currentNamespace(opts);
+    return id;
+};
+
 export const expressionHandlers: Record<string, NodeHandler> = {
+    this: (node, opts) => internals.appendNodeMeta(UAST.thisExpression(), node, opts.sourcefile),
     raw_string_literal: rawString,
     subscript_expression: subscriptExpression,
+    template_function: templateName,
+    template_method: templateName,
     call_expression: callExpression,
     condition_clause: conditionClause,
     if_statement: withConditionDeclarations,

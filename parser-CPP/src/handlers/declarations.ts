@@ -1,3 +1,4 @@
+import * as UAST from '@ant-yasa/uast-spec';
 import { internals, NodeHandler } from '@ant-yasa/uast-parser-c';
 import {
     IN_FUNCTION, NAMESPACE, SyntaxNode, currentNamespace, declaredName, flatten, joinScope, referenceKind, splitQualified,
@@ -80,7 +81,34 @@ const declaration: NodeHandler = (node, opts, next) => {
     return result;
 };
 
+/** Preserve a function-template definition, without claiming instantiation or overload resolution. */
+const templateDeclaration: NodeHandler = (node, opts, next) => {
+    const definition = node.namedChildren.find((child: SyntaxNode) => child.type === 'function_definition');
+    if (!definition) return next(node, opts);
+    const declarator = functionDeclarator(definition.childForFieldName('declarator'));
+    const name = declarator?.childForFieldName('declarator');
+    if (!name || !['identifier', 'qualified_identifier'].includes(name.type)) return next(node, opts);
+    const result = internals.visit(definition, opts);
+    if (result?.type !== 'FunctionDefinition') return result;
+    result._meta.cppTemplate = { parameters: node.childForFieldName('parameters')?.text ?? '' };
+    return result;
+};
+
+/** Retain a using-alias in the same metadata form as a C typedef. */
+const typeAlias: NodeHandler = (node, opts, next) => {
+    const name = node.childForFieldName('name');
+    const type = node.childForFieldName('type');
+    if (!name || !type) return next(node, opts);
+    const noop = UAST.noop();
+    noop._meta.typedef = { name: name.text, type: internals.mapTypeSpecifier(type, opts) };
+    const namespace = currentNamespace(opts);
+    if (namespace) noop._meta.namespace = namespace;
+    return internals.appendNodeMeta(noop, node, opts.sourcefile);
+};
+
 export const declarationHandlers: Record<string, NodeHandler> = {
     function_definition: functionDefinition,
     declaration,
+    template_declaration: templateDeclaration,
+    alias_declaration: typeAlias,
 };
