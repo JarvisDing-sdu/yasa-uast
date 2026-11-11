@@ -676,6 +676,34 @@ function expressionOrNoop(node: SyntaxNode | null | undefined, opts: Record<stri
     return asExpression(node ? visit(node, opts) : null, node, opts?.sourcefile);
 }
 
+/** Build binary trees iteratively: generated C can contain thousands of operands. */
+function binaryExpression(root: SyntaxNode, opts: Record<string, any>): UAST.Expression {
+    type Frame = { node: SyntaxNode; phase: number; left?: UAST.Expression; right?: UAST.Expression };
+    const stack: Frame[] = [{ node: root, phase: 0 }];
+    let result: UAST.Expression | undefined;
+    while (stack.length) {
+        const frame = stack[stack.length - 1];
+        if (frame.phase < 2) {
+            const side = frame.phase++ === 0 ? 'left' : 'right';
+            const child = frame.node.childForFieldName(side);
+            if (child?.type === 'binary_expression' && !opts?.__extensions?.binary_expression) {
+                stack.push({ node: child, phase: 0 });
+            } else {
+                frame[side] = expressionOrNoop(child, opts);
+            }
+        } else {
+            const operator = frame.node.childForFieldName('operator')?.text || getOperator(frame.node);
+            result = appendNodeMeta(UAST.binaryExpression(operator as any, frame.left!, frame.right!), frame.node, opts?.sourcefile);
+            stack.pop();
+            if (stack.length) {
+                const parent = stack[stack.length - 1];
+                parent[parent.phase === 1 ? 'left' : 'right'] = result;
+            }
+        }
+    }
+    return result!;
+}
+
 function firstNonComment(node: SyntaxNode): SyntaxNode | null {
     return node.namedChildren.find((c) => c.type !== 'comment') || null;
 }
@@ -863,6 +891,14 @@ function visit(node: SyntaxNode | null | undefined, opts: Record<string, any>): 
     return visitDefault(node, opts);
 }
 
+function createCompileUnit(root: SyntaxNode, body: any[], opts: Record<string, any>): UAST.Node {
+    const sourcefile = opts?.sourcefile as string | undefined;
+    // uast-spec 0.2.x does not accept C/C++ as a language at construction.
+    const unit = UAST.compileUnit(body, 'php' as any, opts?.__languageVersion ?? 'c11', sourcefile || '', version);
+    (unit as any).language = opts?.__language ?? 'c';
+    return appendNodeMeta(unit, root, sourcefile);
+}
+
 function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, any>): any {
     if (!node) return null;
 
@@ -871,13 +907,7 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
     switch (node.type) {
         case 'translation_unit': {
             const body = visitStatements(node.namedChildren, opts);
-            // NOTE: uast-spec 0.2.x 的 compileUnit() 在 builder() 里做运行时校验，
-            // language 字段只接受 'javascript'|'typescript'|'java'|'golang'|'python'|'php'，
-            // 不认 'c'。因此先传合法值通过运行时校验，再手动修正为 'c'。
-            // 待上游 uast-spec 将 'c' 加入合法语言枚举后可移除此 workaround。
-            const compileUnit = UAST.compileUnit(body, 'php' as any, opts?.__languageVersion ?? 'c11', sourcefile || '', version);
-            (compileUnit as any).language = opts?.__language ?? 'c';
-            return appendNodeMeta(compileUnit, node, sourcefile);
+            return createCompileUnit(node, body, opts);
         }
 
         case 'comment':
@@ -1065,10 +1095,7 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
         }
 
         case 'binary_expression': {
-            const left = expressionOrNoop(node.childForFieldName('left'), opts);
-            const right = expressionOrNoop(node.childForFieldName('right'), opts);
-            const operator = node.childForFieldName('operator')?.text || getOperator(node);
-            return appendNodeMeta(UAST.binaryExpression(operator as any, left, right), node, sourcefile);
+            return binaryExpression(node, opts);
         }
 
         case 'assignment_expression': {
@@ -1334,7 +1361,7 @@ export function parseWithParser(tsParser: TreeSitter.Parser, content: string, op
             const first = errors[0];
             throw new SyntaxError(`C syntax error at ${opts.sourcefile ?? '<source>'}:${first.line}:${first.column}`);
         }
-        const visited = visit(root, {
+        const visitorOptions = {
             ...opts,
             __structs: new Map<string, string[]>(),
             __unionTypes: new Set<string>(),
@@ -1344,16 +1371,13 @@ export function parseWithParser(tsParser: TreeSitter.Parser, content: string, op
             __extensions: opts.extensions,
             __language: opts.language,
             __languageVersion: opts.languageVersion,
-        });
-        // Tree-sitter may return an ERROR as the root. Preserve recovery nodes
-        // and diagnostics while keeping the parser's CompileUnit contract.
-        let unit = visited;
-        if (root.type === 'ERROR') {
-            const body = visited?.type === 'Sequence' ? visited.expressions : visited ? [visited] : [];
-            unit = UAST.compileUnit(body, 'php' as any, opts.languageVersion ?? 'c11', opts.sourcefile || '', version);
-            (unit as any).language = opts.language ?? 'c';
-            appendNodeMeta(unit, root, opts.sourcefile);
-        }
+        };
+        // With an unrecoverable top-level delimiter tree-sitter can return an
+        // ERROR as the root rather than a translation_unit. Preserve both its
+        // diagnostic marker and recoverable children in the normal API shape.
+        const unit = root.type === 'ERROR'
+            ? createCompileUnit(root, visitStatements([root], visitorOptions), visitorOptions)
+            : visit(root, visitorOptions);
         unit._meta.parseErrors = errors;
         unit._meta.includes = env?.includes ?? [];
         return unit;

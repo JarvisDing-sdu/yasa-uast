@@ -197,11 +197,12 @@ function parseDefine(rest: string): MacroDefinition | null {
 
 function parseIntegerLiteral(text: string): number | undefined {
     const t = text.replace(/[uUlL]+$/, '');
-    if (/^0[xX][0-9a-fA-F]+$/.test(t)) return parseInt(t, 16);
-    if (/^0[bB][01]+$/.test(t)) return parseInt(t.slice(2), 2);
-    if (/^0[0-7]*$/.test(t)) return parseInt(t, 8);
-    if (/^[1-9]\d*$/.test(t)) return parseInt(t, 10);
-    return undefined;
+    let value: number | undefined;
+    if (/^0[xX][0-9a-fA-F]+$/.test(t)) value = parseInt(t, 16);
+    else if (/^0[bB][01]+$/.test(t)) value = parseInt(t.slice(2), 2);
+    else if (/^0[0-7]*$/.test(t)) value = parseInt(t, 8);
+    else if (/^[1-9]\d*$/.test(t)) value = parseInt(t, 10);
+    return value !== undefined && Number.isSafeInteger(value) ? value : undefined;
 }
 
 const ESCAPES: Record<string, number> = { n: 10, t: 9, r: 13, '0': 0, '\\': 92, '\'': 39, '"': 34, a: 7, b: 8, f: 12, v: 11 };
@@ -223,18 +224,41 @@ function tokenize(text: string): string[] | null {
     return tokens;
 }
 
+/** Whether a macro replacement can be evaluated as a single primary expression. */
+function isPrimaryReplacement(tokens: string[] | null): boolean {
+    if (!tokens || !tokens.length) return false;
+    if (tokens.length === 1) return true;
+    if (tokens[0] !== '(' || tokens[tokens.length - 1] !== ')') return false;
+    let nesting = 0;
+    for (let i = 0; i < tokens.length; i++) {
+        if (tokens[i] === '(') nesting++;
+        else if (tokens[i] === ')') nesting--;
+        if (nesting < 0 || (nesting === 0 && i !== tokens.length - 1)) return false;
+    }
+    return nesting === 0;
+}
+
 function applyBinary(op: string, l: number, r: number): number | undefined {
+    // A negative value combined with an unsigned C operand may be converted to
+    // uintmax_t first. Signedness is not tracked, so do not guess its result.
+    if (l < 0 || r < 0) return undefined;
+    // JavaScript's bitwise operators truncate to 32 bits; C preprocessing
+    // expressions can use intmax_t/uintmax_t. Handle only non-negative,
+    // exactly representable values and preserve uncertainty otherwise.
+    if (['<<', '>>', '&', '|', '^'].includes(op)) {
+        if (!Number.isSafeInteger(l) || !Number.isSafeInteger(r)) return undefined;
+        if ((op === '<<' || op === '>>') && r > 52) return undefined;
+        const a = BigInt(l), b = BigInt(r);
+        const value = op === '<<' ? a << b : op === '>>' ? a >> b : op === '&' ? a & b : op === '|' ? a | b : a ^ b;
+        return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : undefined;
+    }
+    let value: number | undefined;
     switch (op) {
-        case '+': return l + r;
-        case '-': return l - r;
-        case '*': return l * r;
-        case '/': return r === 0 ? undefined : Math.trunc(l / r);
-        case '%': return r === 0 ? undefined : l % r;
-        case '<<': return l << r;
-        case '>>': return l >> r;
-        case '&': return l & r;
-        case '|': return l | r;
-        case '^': return l ^ r;
+        case '+': value = l + r; break;
+        case '-': value = l - r; break;
+        case '*': value = l * r; break;
+        case '/': value = r === 0 ? undefined : Math.trunc(l / r); break;
+        case '%': value = r === 0 ? undefined : l % r; break;
         case '==': return Number(l === r);
         case '!=': return Number(l !== r);
         case '<': return Number(l < r);
@@ -243,6 +267,7 @@ function applyBinary(op: string, l: number, r: number): number | undefined {
         case '>=': return Number(l >= r);
         default: return undefined;
     }
+    return value !== undefined && Number.isSafeInteger(value) ? value : undefined;
 }
 
 /**
@@ -637,7 +662,9 @@ export class MacroEnvironment {
             if (t === '!' || t === '~' || t === '-' || t === '+') {
                 const v = primary();
                 if (v === undefined) return undefined;
-                return t === '!' ? Number(!v) : t === '~' ? ~v : t === '-' ? -v : v;
+                // Without tracking C signedness/width, `~` can mean different
+                // values for e.g. 0 and 0U. Do not choose a branch from it.
+                return t === '!' ? Number(!v) : t === '~' ? undefined : t === '-' ? -v : v;
             }
             if (t === 'defined') {
                 const paren = peek() === '(';
@@ -652,25 +679,51 @@ export class MacroEnvironment {
                 const inner = t.slice(1, -1);
                 if (inner.length === 1) return inner.charCodeAt(0);
                 if (inner.startsWith('\\') && inner.length === 2 && inner[1] in ESCAPES) return ESCAPES[inner[1]];
+                // Numeric escapes represent a single execution character. A
+                // value above 127 can be negative or positive when converted
+                // to int, depending on the target's plain-char signedness.
+                // The preprocessor options do not specify that property.
+                const octal = /^\\([0-7]{1,3})$/.exec(inner);
+                const hex = /^\\x([0-9a-fA-F]+)$/.exec(inner);
+                const value = octal ? parseInt(octal[1], 8) : hex ? parseInt(hex[1], 16) : undefined;
+                if (value !== undefined && value <= 127) return value;
                 return undefined;
             }
             if (/^[A-Za-z_]/.test(t)) {
                 if (peek() === '(') {
-                    // function-like macro call: skip its arguments
-                    let level = 0;
-                    do {
+                    // Parenthesized function-macro replacements are safe to
+                    // evaluate as one primary expression: their precedence is
+                    // independent of the surrounding expression. Keep other
+                    // replacements unknown instead of changing C precedence.
+                    next();
+                    const args: string[][] = [[]];
+                    let level = 1;
+                    while (level && pos < tokens.length) {
                         const u = next();
-                        if (u === undefined) break;
                         if (u === '(') level++;
                         else if (u === ')') level--;
-                    } while (level > 0);
-                    return undefined;
+                        if (!level) break;
+                        if (u === ',' && level === 1) args.push([]);
+                        else args[args.length - 1].push(u);
+                    }
+                    if (level) { failed = true; return undefined; }
+                    const value = this.value(t);
+                    if (value.length !== 1 || !value[0] || value[0] === UNKNOWN) return undefined;
+                    const def = value[0];
+                    if (def.params === null) return undefined;
+                    if (args.length === 1 && !args[0].length && def.params.length === 0) args.length = 0;
+                    if (args.length < def.params.length || (!def.variadic && args.length !== def.params.length)) return undefined;
+                    const replacement = substitute(def, args.map((arg) => arg.join(' ')));
+                    return isPrimaryReplacement(tokenize(replacement)) ? this.evaluate(replacement, depth + 1) : undefined;
                 }
                 const value = this.value(t);
                 if (value.length !== 1 || value[0] === UNKNOWN) return undefined;
                 const def = value[0];
                 if (def === null) return 0;
-                if (def.params !== null || !def.body) return undefined;
+                // Macro expansion is textual, not an implicit pair of parentheses.
+                // Evaluating `#define X 1 + 2` as a primary in `3 * X` would
+                // select the wrong branch. Keep both branches when in doubt.
+                if (def.params !== null || !isPrimaryReplacement(tokenize(def.body))) return undefined;
                 return this.evaluate(def.body, depth + 1);
             }
             failed = true;

@@ -145,6 +145,28 @@ describe('parser-C', () => {
             assert.deepStrictEqual(imports.map((i: any) => [i.from.value, i._meta.system]), [['stdio.h', true], ['local.h', false]]);
         });
 
+        it('recovers declarations and functions when the tree root is an ERROR', () => {
+            // A missing delimiter makes tree-sitter wrap the entire file in an
+            // ERROR, but complete constructs inside it remain recoverable.
+            const code = 'int broken( {\nint count;\nint valid(void) { return 42; }';
+            const ast = unit(code);
+            assert.strictEqual(ast.type, 'CompileUnit');
+            assert.strictEqual(ast.language, 'c');
+            assert.strictEqual(ast.loc.sourcefile, 't.c');
+            assert.ok(ast._meta.parseErrors.length > 0);
+            assert.ok(ast.body.some((n: any) => n._meta?.syntaxError));
+            assert.ok(ast.body.some((n: any) => n.type === 'VariableDeclaration' && n.id.name === 'count'));
+            const fn = ast.body.find((n: any) => n.type === 'FunctionDefinition' && n.id.name === 'valid');
+            assert.strictEqual(fn.body.body[0].argument.value, 42);
+            assert.throws(() => unit(code, { strict: true }), SyntaxError);
+
+            const preprocessed: any = new Parser().parsePreprocessed(code, { language: 'cpp', languageVersion: 'c++17' });
+            assert.strictEqual(preprocessed.type, 'CompileUnit');
+            assert.strictEqual(preprocessed.language, 'cpp');
+            assert.strictEqual(preprocessed.languageVersion, 'c++17');
+            assert.ok(preprocessed.body.some((n: any) => n.type === 'FunctionDefinition' && n.id.name === 'valid'));
+        });
+
         it('records source locations', () => {
             const decl = body('\n  int value = 1;')[0];
             assert.deepStrictEqual(decl.id.loc.start, { line: 2, column: 7 });
@@ -288,6 +310,22 @@ describe('parser-C', () => {
     });
 
     describe('expressions', () => {
+        it('retains long binary expression chains without overflowing the visitor stack', () => {
+            const count = 2000;
+            const ast = unit(`int f(void) { return ${Array(count).fill('value').join(' + ')}; }`, { strict: true });
+            const statement = ast.body[0].body.body[0];
+            assert.strictEqual(statement.type, 'ReturnStatement');
+            let expression = statement.argument;
+            for (let i = 1; i < count; i++) {
+                assert.strictEqual(expression.type, 'BinaryExpression');
+                assert.strictEqual(expression.operator, '+');
+                assert.strictEqual(expression.right.name, 'value');
+                expression = expression.left;
+            }
+            assert.strictEqual(expression.name, 'value');
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+        });
+
         it('maps operators', () => {
             const stmts = fnBody('void f(int a, int b) { a += b << 2; a = !b; a = b++; a = ++b; a = b ? a : 0; a = (b, 3); }');
             const rights = stmts.map((s: any) => s.expression);
@@ -681,6 +719,71 @@ void g(void) { sink(IN()); }`;
             assert.deepStrictEqual(branch.loc.start, { line: 6, column: 3 });
             assert.deepStrictEqual(calls(code, { preprocessor: { defines: { ENABLED: '1' }, unknownMacros: 'undefined' } }), ['test', 'yes', 'fallback']);
             assert.deepStrictEqual(ast._meta.parseErrors, []);
+        });
+
+        it('resolves a function-like macro in a condition splitting an else body', () => {
+            const code = '#define CHECK(v) ((v) >= 2)\nvoid f(void) {\n#if CHECK(VERSION)\n  if (test()) yes(); else {\n#endif\n  fallback();\n#if CHECK(VERSION)\n  }\n#endif\n}\n';
+            const opts = { preprocessor: { defines: { VERSION: '2' }, unknownMacros: 'undefined' } };
+            const ast = unit(code, opts);
+            const fn = ast.body.find((n: any) => n.type === 'FunctionDefinition' && n.id.name === 'f');
+            assert.ok(fn);
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+            assert.deepStrictEqual(calls(code, opts), ['test', 'yes', 'fallback']);
+        });
+
+        it('evaluates nested parenthesized function macros without guessing unsafe replacements', () => {
+            const code = '#define GE(a,b) ((a) >= (b))\n#define VERSION_OK(v) (GE(v, 2))\n#if VERSION_OK(1 + 1)\nvoid selected(void) {}\n#else\nvoid discarded(void) {}\n#endif\n';
+            const ast = unit(code);
+            assert.deepStrictEqual(ast.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['selected']);
+            assert.deepStrictEqual(ast._meta.parseErrors, []);
+
+            // The replacement `1 + 2` must not be evaluated as a primary:
+            // in C, `3 * EXPR()` expands to `3 * 1 + 2`, not `3 * (1 + 2)`.
+            const uncertain = '#define EXPR() 1 + 2\n#if 3 * EXPR() == 5\nvoid a(void) {}\n#else\nvoid b(void) {}\n#endif\n';
+            const both = unit(uncertain);
+            assert.deepStrictEqual(both.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['a', 'b']);
+        });
+
+        it('does not change operator precedence when evaluating object-like macro replacements', () => {
+            // C expands `3 * X` to `3 * 1 + 2`, not `3 * (1 + 2)`.
+            const uncertain = '#define X 1 + 2\n#if 3 * X == 5\nvoid correct(void) {}\n#else\nvoid wrong(void) {}\n#endif\n';
+            const both = unit(uncertain);
+            assert.deepStrictEqual(both.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['correct', 'wrong']);
+
+            const wrapped = '#define X (1 + 2)\n#if 3 * X == 9\nvoid correct(void) {}\n#else\nvoid wrong(void) {}\n#endif\n';
+            const selected = unit(wrapped);
+            assert.deepStrictEqual(selected.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['correct']);
+
+            const nested = '#define X 1 + 2\n#define F(v) (3 * v)\n#if F(X) == 5\nvoid correct(void) {}\n#else\nvoid wrong(void) {}\n#endif\n';
+            const nestedResult = unit(nested);
+            assert.deepStrictEqual(nestedResult.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['correct', 'wrong']);
+        });
+
+        it('does not truncate C preprocessor arithmetic to JavaScript 32-bit values', () => {
+            const wide = '#if (1ULL << 40) == 1099511627776ULL\nvoid selected(void) {}\n#else\nvoid discarded(void) {}\n#endif\n';
+            const ast = unit(wide);
+            assert.deepStrictEqual(ast.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['selected']);
+
+            // Numbers that cannot be represented exactly and signed-width
+            // dependent complements must not silently select a branch.
+            for (const condition of ['9007199254740993ULL == 9007199254740992ULL', '~0U == 0', '-1 < 1U']) {
+                const uncertain = unit(`#if ${condition}\nvoid a(void) {}\n#else\nvoid b(void) {}\n#endif\n`);
+                assert.deepStrictEqual(uncertain.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['a', 'b']);
+            }
+        });
+
+        it('evaluates portable numeric character escapes and preserves target-dependent conditions', () => {
+            for (const condition of ["'\\101' == 65", "'\\x41' == 65", "'\\177' == 127"]) {
+                const ast = unit(`#if ${condition}\nvoid selected(void) {}\n#else\nvoid discarded(void) {}\n#endif\n`);
+                assert.deepStrictEqual(ast.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['selected']);
+            }
+            // SQLite uses '\\301' when detecting an EBCDIC target. Without
+            // knowing the execution character set and plain-char signedness,
+            // selecting either branch would guess target-specific semantics.
+            for (const condition of ["'\\301' == 193", "'\\x80' == 128"]) {
+                const ast = unit(`#if ${condition}\nvoid a(void) {}\n#else\nvoid b(void) {}\n#endif\n`);
+                assert.deepStrictEqual(ast.body.filter((n: any) => n.type === 'FunctionDefinition').map((n: any) => n.id.name), ['a', 'b']);
+            }
         });
 
         it('keeps unknown groups inside a resolved group structurally represented', () => {
