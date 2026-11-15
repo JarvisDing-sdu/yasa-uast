@@ -8,3 +8,8 @@ copy this grammar into a tree-sitter-c 0.23.6 package directory, run
 C and C++ parser suites and validate representative Engine dumps after rebuilding.
 The original grammar package remains a dependency for reference and upstream
 comparison. Changes to the grammar and generated WASM must be reviewed together.
+
+The experimental branch also accepts GNU statement attributes, builtin
+expressions with type operands, and typeof type specifiers. Changes preserve
+operand structure in UAST metadata. Rebuild the WASM with the versions above
+and run the parser and Engine suites together.

@@ -29,3 +29,10 @@ npm install
 npm test
 npm run build
 ```
+
+## Unified package entry (experimental)
+
+`new Parser({ language: 'c' })` uses the C grammar and C visitor. The default
+language is `cpp`. Both `parse` and `parsePreprocessed` accept a per-call
+`language` override. The package currently depends on parser-C for its shared
+implementation. Rebuild parser-C before refreshing parser-CPP dependencies.

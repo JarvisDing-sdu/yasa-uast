@@ -210,6 +210,13 @@ function mapTypeSpecifier(node: SyntaxNode | null | undefined, opts: Record<stri
         case 'type_identifier':
         case 'identifier':
             return cIdentifier(node.text, node, sourcefile) as any;
+        case 'typeof_specifier': {
+            const argument = node.childForFieldName('argument');
+            const type = dynamicType(node, sourcefile);
+            if (argument?.type === 'type_descriptor') type._meta.typeofType = mapTypeSpecifier(argument, opts);
+            else if (argument) type._meta.typeofExpression = visit(argument, opts);
+            return type;
+        }
         case 'type_descriptor': {
             const base = mapTypeSpecifier(node.childForFieldName('type'), opts);
             return applyDeclaratorType(base, node.childForFieldName('declarator'), opts);
@@ -1130,6 +1137,18 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
             return appendNodeMeta(UAST.callExpression(cIdentifier(keyword, node, sourcefile), [argument]), node, sourcefile);
         }
 
+        case 'type_compatibility_expression': {
+            const result = UAST.callExpression(cIdentifier('__builtin_types_compatible_p', node, sourcefile), []);
+            result._meta.typeArguments = ['left', 'right'].map(field => mapTypeSpecifier(node.childForFieldName(field), opts));
+            return appendNodeMeta(result, node, sourcefile);
+        }
+
+        case 'va_arg_expression': {
+            const result = UAST.callExpression(cIdentifier('__builtin_va_arg', node, sourcefile), [expressionOrNoop(node.childForFieldName('argument'), opts)]);
+            result._meta.typeArguments = [mapTypeSpecifier(node.childForFieldName('type'), opts)];
+            return appendNodeMeta(result, node, sourcefile);
+        }
+
         case 'offsetof_expression': {
             const typeNode = node.childForFieldName('type');
             const member = node.childForFieldName('member');
@@ -1252,8 +1271,11 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
 
         case 'attributed_statement': {
             // `__attribute__((fallthrough));` and `[[nodiscard]] stmt`: keep the statement.
-            const stmt = node.namedChildren.filter((c) => c.type !== 'attribute_declaration' && c.type !== 'comment').pop();
-            return stmt ? visit(stmt, opts) : appendNodeMeta(UAST.noop(), node, sourcefile);
+            const attributes = node.namedChildren.filter((c) => ['attribute_declaration', 'attribute_specifier'].includes(c.type));
+            const stmt = node.namedChildren.filter((c) => !['attribute_declaration', 'attribute_specifier', 'comment'].includes(c.type)).pop();
+            const result = stmt ? visit(stmt, opts) : UAST.noop();
+            if (attributes.length) result._meta.attributes = attributes.map(attribute => attribute.text);
+            return appendNodeMeta(result, node, sourcefile);
         }
 
         case 'ERROR': {
@@ -1342,12 +1364,19 @@ export interface ParseOptions extends Record<string, any> {
  */
 export function parseWithParser(tsParser: TreeSitter.Parser, content: string, opts: ParseOptions = {}): UAST.Node {
     let source = content.replace(/^\uFEFF/, '');
+    const diagnosticPragmas: Array<{ offset: number; text: string }> = [];
     if (opts.preprocessed) {
         // GCC system headers use __signed__ as a synonym for signed. The C
         // grammar does not recognize it as a type specifier. Keep byte/column
         // offsets unchanged and never rewrite strings, characters or comments.
-        source = source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\([\s\S]*?\)\1"|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\b__signed__\b/g,
-            (token) => token === '__signed__' ? 'signed'.padEnd(token.length, ' ') : token);
+        source = source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\([\s\S]*?\)\1"|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\b__signed__\b|^[ \t]*#[ \t]*pragma[ \t]+(?:clang|GCC)[ \t]+diagnostic\b[^\r\n]*/gm,
+            (token, _delimiter, offset) => {
+                if (/^[ \t]*#/.test(token)) {
+                    diagnosticPragmas.push({ offset, text: token });
+                    return ' '.repeat(token.length);
+                }
+                return token === '__signed__' ? 'signed'.padEnd(token.length, ' ') : token;
+            });
     }
     const env = opts.preprocessed ? undefined
         : new MacroEnvironment(source, opts.preprocessor ?? {}, opts.sourcefile);
@@ -1380,6 +1409,9 @@ export function parseWithParser(tsParser: TreeSitter.Parser, content: string, op
             : visit(root, visitorOptions);
         unit._meta.parseErrors = errors;
         unit._meta.includes = env?.includes ?? [];
+        if (diagnosticPragmas.length) unit._meta.diagnosticPragmas = diagnosticPragmas.map(pragma => ({
+            line: source.slice(0, pragma.offset).split('\n').length, text: pragma.text,
+        }));
         return unit;
     } finally {
         tree.delete();
@@ -1399,4 +1431,5 @@ export const internals = {
     applyDeclaratorType,
     createFunction,
     createDeclaration,
+    createParameter,
 };

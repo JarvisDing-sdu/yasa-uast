@@ -29,7 +29,7 @@ function markReferences(declarators: SyntaxNode[], declarations: any[]): void {
  * @returns function_declarator, or null
  */
 function functionDeclarator(node: SyntaxNode | null): SyntaxNode | null {
-    for (let current = node; current; current = current.childForFieldName('declarator')) {
+    for (let current = node; current; current = current.childForFieldName('declarator') ?? current.namedChildren.find((child: SyntaxNode) => child.type.endsWith('declarator')) ?? null) {
         if (current.type === 'function_declarator') return current;
     }
     return null;
@@ -48,13 +48,20 @@ const functionDefinition: NodeHandler = (node, opts, next) => {
     const namespace = nameNode?.text.trimStart().startsWith('::') ? qualifier : joinScope(currentNamespace(opts), qualifier);
     const result = next(node, { ...opts, [IN_FUNCTION]: true, [NAMESPACE]: namespace });
     if (result?.type !== 'FunctionDefinition') return result;
+    const definitionName = nameNode?.type === 'qualified_identifier' ? splitQualified(nameNode).name : nameNode;
+    if (definitionName) result.id = internals.cIdentifier(definitionName.text, definitionName, opts.sourcefile);
     if (namespace) {
         result._meta.namespace = namespace;
         if (result.id?.name) result._meta.qualifiedName = joinScope(namespace, result.id.name);
     }
-    const params = (declarator?.childForFieldName('parameters')?.namedChildren ?? [])
-        .map((p: SyntaxNode) => p.childForFieldName('declarator'))
-        .filter(Boolean);
+    const parameterNodes = declarator?.childForFieldName('parameters')?.namedChildren ?? [];
+    const supportedParameters = parameterNodes.filter((parameter: SyntaxNode) => ['parameter_declaration', 'optional_parameter_declaration', 'variadic_parameter_declaration'].includes(parameter.type));
+    if (!(supportedParameters.length === 1 && supportedParameters[0].text === 'void')) {
+        result.parameters = supportedParameters.map((parameter: SyntaxNode) => internals.visit(parameter, opts));
+    }
+    const params = supportedParameters.map((parameter: SyntaxNode) => parameter.childForFieldName('declarator')).filter(Boolean);
+    const returnReference = referenceKind(node.childForFieldName('declarator'));
+    if (returnReference) result._meta.cppReturnReference = returnReference;
     markReferences(params, result.parameters || []);
     return result;
 };
@@ -78,20 +85,61 @@ const declaration: NodeHandler = (node, opts, next) => {
             decl._meta.qualifiedName = joinScope(namespace, decl.id.name);
         }
     }
+    const type = node.childForFieldName('type');
+    if (type?.type === 'class_specifier' && type.childForFieldName('body')) {
+        return internals.appendNodeMeta(UAST.sequence([internals.visit(type, opts), ...declarations]), node, opts.sourcefile);
+    }
     return result;
+};
+
+/** Reuse C parameter conversion and retain C++ default values and parameter packs. */
+const parameterDeclaration: NodeHandler = (node, opts) => {
+    const parameter = internals.createParameter(node, opts);
+    const value = node.childForFieldName('default_value');
+    if (value) parameter.init = internals.expressionOrNoop(value, opts);
+    const reference = referenceKind(node.childForFieldName('declarator'));
+    if (reference) parameter._meta.reference = reference;
+    if (node.type === 'variadic_parameter_declaration') parameter._meta.cppParameterPack = true;
+    return parameter;
 };
 
 /** Preserve a function-template definition, without claiming instantiation or overload resolution. */
 const templateDeclaration: NodeHandler = (node, opts, next) => {
-    const definition = node.namedChildren.find((child: SyntaxNode) => child.type === 'function_definition');
+    const definition = node.namedChildren.find((child: SyntaxNode) => ['function_definition', 'class_specifier', 'struct_specifier'].includes(child.type));
     if (!definition) return next(node, opts);
     const declarator = functionDeclarator(definition.childForFieldName('declarator'));
-    const name = declarator?.childForFieldName('declarator');
-    if (!name || !['identifier', 'qualified_identifier'].includes(name.type)) return next(node, opts);
+    const name = definition.type === 'function_definition' ? declarator?.childForFieldName('declarator') : definition.childForFieldName('name');
+    if (!name || !['identifier', 'field_identifier', 'qualified_identifier', 'type_identifier', 'template_type'].includes(name.type)) return next(node, opts);
     const result = internals.visit(definition, opts);
-    if (result?.type !== 'FunctionDefinition') return result;
+    if (!['FunctionDefinition', 'ClassDefinition'].includes(result?.type)) return result;
     result._meta.cppTemplate = { parameters: node.childForFieldName('parameters')?.text ?? '' };
     return result;
+};
+
+/** Preserve C++ class bodies, including member and nested template definitions. */
+const classSpecifier: NodeHandler = (node, opts) => {
+    const name = node.childForFieldName('name');
+    const body = node.childForFieldName('body');
+    if (!body) {
+        const forward = UAST.noop();
+        forward._meta.cppForwardDeclaration = name?.text ?? null;
+        return internals.appendNodeMeta(forward, node, opts.sourcefile);
+    }
+    const namespace = joinScope(currentNamespace(opts), name?.text ?? 'anonymous_class');
+    const members = flatten(body.namedChildren.map((child: SyntaxNode) => internals.visit(child, { ...opts, [NAMESPACE]: namespace })));
+    const id = internals.cIdentifier(name?.text ?? 'anonymous_class', name || node, opts.sourcefile);
+    const result = UAST.classDefinition(id, members, []);
+    result._meta.kind = node.type === 'struct_specifier' ? 'struct' : 'class';
+    result._meta.qualifiedName = namespace;
+    const bases = node.namedChildren.find((child: SyntaxNode) => child.type === 'base_class_clause');
+    if (bases) result._meta.cppBases = bases.text;
+    return internals.appendNodeMeta(result, node, opts.sourcefile);
+};
+
+const accessSpecifier: NodeHandler = (node, opts) => {
+    const marker = UAST.noop();
+    marker._meta.cppAccess = node.text;
+    return internals.appendNodeMeta(marker, node, opts.sourcefile);
 };
 
 /** Retain a using-alias in the same metadata form as a C typedef. */
@@ -109,6 +157,12 @@ const typeAlias: NodeHandler = (node, opts, next) => {
 export const declarationHandlers: Record<string, NodeHandler> = {
     function_definition: functionDefinition,
     declaration,
+    field_declaration: declaration,
     template_declaration: templateDeclaration,
     alias_declaration: typeAlias,
+    class_specifier: classSpecifier,
+    access_specifier: accessSpecifier,
+    parameter_declaration: parameterDeclaration,
+    optional_parameter_declaration: parameterDeclaration,
+    variadic_parameter_declaration: parameterDeclaration,
 };

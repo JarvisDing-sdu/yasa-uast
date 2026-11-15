@@ -7,6 +7,88 @@ describe('parser-CPP preprocessed input', () => {
     const parser = new Parser({ sourcefile: 'prepared.cpp', languageVersion: 'c++20', preprocessor: { defines: { VALUE: '99' } } });
     before(async () => { await parser.init(); });
 
+    it('retains class and class-template member bodies and their scope', () => {
+        const ast: any = parser.parsePreprocessed('namespace N { template<class T> class Box { public: T get(){ return T(); } template<class U> U convert(U x){ return x; } }; }', { strict: true });
+        const [box] = collect(ast, n => n.type === 'ClassDefinition');
+        assert.strictEqual(box.id.name, 'Box');
+        assert.strictEqual(box._meta.cppTemplate.parameters, '<class T>');
+        assert.strictEqual(box._meta.qualifiedName, 'N::Box');
+        const functions = collect(box, n => n.type === 'FunctionDefinition');
+        assert.deepStrictEqual(functions.map(n => n.id.name), ['get', 'convert']);
+        assert.strictEqual(functions[1]._meta.cppTemplate.parameters, '<class U>');
+        assert.strictEqual(functions[0]._meta.qualifiedName, 'N::Box::get');
+        assert.strictEqual(collect(box, n => n._meta?.cppAccess === 'public').length, 1);
+    });
+
+    it('retains embedded and nested class definitions alongside object declarations', () => {
+        const ast: any = parser.parsePreprocessed('class Outer { class Inner { int value(){ return 1; } }; }; class Item { int get(){ return 2; } } item;', { strict: true });
+        assert.deepStrictEqual(collect(ast, n => n.type === 'ClassDefinition').map(n => n.id.name), ['Outer', 'Inner', 'Item']);
+        assert.deepStrictEqual(collect(ast, n => n.type === 'FunctionDefinition').map(n => n.id.name), ['value', 'get']);
+        assert.ok(collect(ast, n => n.type === 'VariableDeclaration' && n.id.name === 'item').length);
+    });
+
+    it('preserves member names for out-of-line class-template methods and operators', () => {
+        const ast: any = parser.parsePreprocessed('template<class T> class Box { public: T get(); }; template<class T> T Box<T>::get(){ return T(); } class C { public: C() {} ~C() {} int operator()(int x){ return x; } };', { strict: true });
+        const functions = collect(ast, n => n.type === 'FunctionDefinition');
+        assert.deepStrictEqual(functions.map(n => n.id.name), ['get', 'C', '~C', 'operator()']);
+        assert.strictEqual(functions[0]._meta.qualifiedName, 'Box<T>::get');
+    });
+
+    it('retains range-loop initialization, element references and body calls', () => {
+        const ast: any = parser.parsePreprocessed('void f(){ for(auto values=make(); const auto &value: values) sink(value); }', { strict: true });
+        const [loop] = collect(ast, n => n.type === 'RangeStatement');
+        assert.strictEqual(loop.value.id.name, 'value');
+        assert.strictEqual(loop.value._meta.reference, 'lvalue');
+        assert.strictEqual(loop.right.name, 'values');
+        assert.deepStrictEqual(collect(ast, n => n.type === 'CallExpression').map(n => n.callee.name), ['make', 'sink']);
+    });
+
+    it('retains try bodies, typed handlers, catch-all handlers and rethrows', () => {
+        const ast: any = parser.parsePreprocessed('void f(){ try { sink(); } catch(const Error &error) { handle(error); throw; } catch(...) { fallback(); } }', { strict: true });
+        const [statement] = collect(ast, n => n.type === 'TryStatement');
+        assert.strictEqual(statement.handlers.length, 2);
+        assert.strictEqual(statement.handlers[0].parameter[0].id.name, 'error');
+        assert.strictEqual(statement.handlers[1]._meta.cppCatchAll, true);
+        assert.deepStrictEqual(collect(ast, n => n.type === 'CallExpression').map(n => n.callee.name), ['sink', 'handle', 'fallback']);
+        assert.strictEqual(collect(ast, n => n.type === 'ThrowStatement')[0].argument, null);
+    });
+
+    it('retains reference-returning template bodies, default parameters and parameter packs', () => {
+        const ast: any = parser.parsePreprocessed('class C { template<class... Args> C &add(int value = 2, Args &&...args){ sink(value); return *this; } };', { strict: true });
+        const [fn] = collect(ast, n => n.type === 'FunctionDefinition');
+        assert.strictEqual(fn.id.name, 'add');
+        assert.strictEqual(fn._meta.cppReturnReference, 'lvalue');
+        assert.strictEqual(fn.parameters.length, 2);
+        assert.strictEqual(fn.parameters[0].init.value, 2);
+        assert.strictEqual(fn.parameters[1]._meta.cppParameterPack, true);
+        assert.strictEqual(fn.parameters[1]._meta.reference, 'rvalue');
+        assert.strictEqual(collect(fn, n => n.type === 'CallExpression')[0].callee.name, 'sink');
+    });
+
+    it('supports C and C++ through one package with per-call language isolation', async () => {
+        const unified = new Parser({ language: 'c', sourcefile: 'unit.c' });
+        await unified.init();
+        const code = '#ifdef __cplusplus\nint cpp_only;\n#else\nstruct S { unsigned :3, value:2; };\n#endif';
+        const c: any = unified.parse(code);
+        assert.strictEqual(c.language, 'c');
+        assert.deepStrictEqual(c._meta.parseErrors, []);
+        assert.strictEqual(collect(c, n => n.type === 'ClassDefinition')[0].id.name, 'S');
+        const cpp: any = unified.parse(code, { language: 'cpp' });
+        assert.strictEqual(cpp.language, 'cpp');
+        assert.strictEqual(collect(cpp, n => n.type === 'VariableDeclaration')[0].id.name, 'cpp_only');
+        const prepared: any = unified.parsePreprocessed('int f(void){ return 1; }');
+        assert.strictEqual(prepared.language, 'c');
+        assert.strictEqual(unified.parse(code).language, 'c');
+        assert.throws(() => unified.parse('int x;', { language: 'rust' }), /Unsupported parser language/);
+    });
+
+    it('preserves diagnostic-looking text inside multiline C++ raw strings', () => {
+        const code = 'const char *text = R"tag(\n#pragma clang diagnostic push\n__signed__\n)tag";';
+        const ast: any = parser.parsePreprocessed(code, { strict: true });
+        assert.strictEqual(ast._meta.diagnosticPragmas, undefined);
+        assert.strictEqual(collect(ast, n => n.type === 'VariableDeclaration')[0].init.value, '\n#pragma clang diagnostic push\n__signed__\n');
+    });
+
     it('accepts GCC signed type spelling without changing C++ raw strings', () => {
         const ast: any = parser.parsePreprocessed('typedef __signed__ char s8;\nconst char *s = R"tag(\"__signed__\")tag";', { strict: true });
         assert.deepStrictEqual(ast._meta.parseErrors, []);

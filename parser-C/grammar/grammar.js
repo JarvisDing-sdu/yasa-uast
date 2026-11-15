@@ -588,6 +588,7 @@ module.exports = grammar({
     ),
 
     type_specifier: $ => choice(
+      $.typeof_specifier,
       $.struct_specifier,
       $.union_specifier,
       $.enum_specifier,
@@ -595,6 +596,11 @@ module.exports = grammar({
       $.sized_type_specifier,
       $.primitive_type,
       $._type_identifier,
+    ),
+
+    typeof_specifier: $ => seq(
+      choice('typeof', '__typeof', '__typeof__'), '(',
+      field('argument', choice($.type_descriptor, $.expression)), ')',
     ),
 
     sized_type_specifier: $ => choice(
@@ -777,7 +783,7 @@ module.exports = grammar({
     // Statements
 
     attributed_statement: $ => seq(
-      repeat1($.attribute_declaration),
+      repeat1(choice($.attribute_declaration, $.attribute_specifier)),
       $.statement,
     ),
 
@@ -958,6 +964,8 @@ module.exports = grammar({
       $.sizeof_expression,
       $.alignof_expression,
       $.offsetof_expression,
+      $.type_compatibility_expression,
+      $.va_arg_expression,
       $.generic_expression,
       $.subscript_expression,
       $.call_expression,
@@ -1100,8 +1108,17 @@ module.exports = grammar({
     )),
 
     offsetof_expression: $ => prec(PREC.OFFSETOF, seq(
-      'offsetof',
+      choice('offsetof', '__builtin_offsetof'),
       seq('(', field('type', $.type_descriptor), ',', field('member', $._field_identifier), ')'),
+    )),
+
+    type_compatibility_expression: $ => prec(PREC.CALL, seq(
+      '__builtin_types_compatible_p', '(',
+      field('left', $.type_descriptor), ',', field('right', $.type_descriptor), ')',
+    )),
+
+    va_arg_expression: $ => prec(PREC.CALL, seq(
+      '__builtin_va_arg', '(', field('argument', $.expression), ',', field('type', $.type_descriptor), ')',
     )),
 
     generic_expression: $ => prec(PREC.CALL, seq(

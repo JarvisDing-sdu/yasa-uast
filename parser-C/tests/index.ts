@@ -21,6 +21,46 @@ describe('parser-C preprocessed input', () => {
         assert.deepStrictEqual(ast._meta.parseErrors, []);
     });
 
+    it('preserves GNU statement attributes and the surrounding control flow', () => {
+        const ast: any = parser.parsePreprocessed('int f(int x) { switch(x) { case 1: x++; __attribute__((fallthrough)); default: return x; } }', { strict: true });
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+        const attributes = collect(ast, n => !!n._meta?.attributes);
+        assert.strictEqual(attributes.length, 1);
+        assert.deepStrictEqual(attributes[0]._meta.attributes, ['__attribute__((fallthrough))']);
+        assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement').length, 1);
+    });
+
+    it('preserves compiler builtins with type operands and value operands', () => {
+        const code = 'struct S { int value; }; int f(void *ap) { int same = __builtin_types_compatible_p(long, int); char *p = __builtin_va_arg(ap, char *); return same + __builtin_offsetof(struct S, value); }';
+        const ast: any = parser.parsePreprocessed(code, { strict: true });
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+        const calls = collect(ast, n => n.type === 'CallExpression');
+        const compatible = calls.find(n => n.callee.name === '__builtin_types_compatible_p');
+        assert.strictEqual(compatible._meta.typeArguments.length, 2);
+        assert.strictEqual(compatible._meta.typeArguments[0].id.name, 'long');
+        const va = calls.find(n => n.callee.name === '__builtin_va_arg');
+        assert.strictEqual(va.arguments[0].name, 'ap');
+        assert.ok(va._meta.typeArguments[0]);
+        assert.ok(calls.find(n => n.callee.name === 'offsetof'));
+        assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement').length, 1);
+    });
+
+    it('preserves typeof expressions used as builtin type operands', () => {
+        const ast: any = parser.parsePreprocessed('int f(long value) { return __builtin_types_compatible_p(__typeof__((long)value), long); }', { strict: true });
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+        const call = collect(ast, n => n.type === 'CallExpression')[0];
+        assert.ok(call._meta.typeArguments[0]._meta.typeofExpression);
+    });
+
+    it('keeps diagnostic pragmas from interrupting an if body and retains their provenance', () => {
+        const code = 'int f(int x) { if(x)\n#pragma clang diagnostic push\n#pragma clang diagnostic ignored "-Wcast-function-type-strict"\n x = 2;\n#pragma clang diagnostic pop\n return x; }';
+        const ast: any = parser.parsePreprocessed(code, { strict: true });
+        assert.deepStrictEqual(ast._meta.parseErrors, []);
+        assert.strictEqual(ast._meta.diagnosticPragmas.length, 3);
+        assert.strictEqual(ast._meta.diagnosticPragmas[0].line, 2);
+        assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement')[0].loc.start.line, 6);
+    });
+
     it('accepts GCC signed type spelling without modifying literals or offsets', () => {
         const ast: any = parser.parsePreprocessed('typedef __signed__ char s8;\nconst char *s = "__signed__";\n', { strict: true });
         assert.deepStrictEqual(ast._meta.parseErrors, []);
