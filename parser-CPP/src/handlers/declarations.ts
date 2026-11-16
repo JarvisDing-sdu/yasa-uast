@@ -54,6 +54,22 @@ const functionDefinition: NodeHandler = (node, opts, next) => {
         result._meta.namespace = namespace;
         if (result.id?.name) result._meta.qualifiedName = joinScope(namespace, result.id.name);
     }
+    let enclosing = node.parent;
+    while (enclosing && !['class_specifier', 'struct_specifier', 'namespace_definition', 'translation_unit'].includes(enclosing.type)) {
+        enclosing = enclosing.parent;
+    }
+    const recordName = ['class_specifier', 'struct_specifier'].includes(enclosing?.type ?? '')
+        ? enclosing?.childForFieldName('name')?.text : undefined;
+    const owner = (recordName ?? namespace.split('::').at(-1))?.replace(/<.*>$/, '');
+    if (!node.childForFieldName('type') && owner && result.id?.name === owner) {
+        result._meta.isConstructor = true;
+        const initializers = node.namedChildren.find((child: SyntaxNode) => child.type === 'field_initializer_list');
+        if (initializers) {
+            result._meta.cppConstructorInitializers = initializers.text;
+            result._meta.unhandled = { kind: 'cpp_constructor_initializer_semantics' };
+        }
+
+    }
     const parameterNodes = declarator?.childForFieldName('parameters')?.namedChildren ?? [];
     const supportedParameters = parameterNodes.filter((parameter: SyntaxNode) => ['parameter_declaration', 'optional_parameter_declaration', 'variadic_parameter_declaration'].includes(parameter.type));
     if (!(supportedParameters.length === 1 && supportedParameters[0].text === 'void')) {

@@ -7,6 +7,32 @@ describe('parser-CPP preprocessed input', () => {
     const parser = new Parser({ sourcefile: 'prepared.cpp', languageVersion: 'c++20', preprocessor: { defines: { VALUE: '99' } } });
     before(async () => { await parser.init(); });
 
+    it('preserves lambda parameters, bodies, explicit return types and capture limits', () => {
+        const ast: any = parser.parsePreprocessed('int target(int); int run(){int x=2; auto a=[](int v)->int{return target(v);}; auto b=[&x](){return target(x);}; return a(b());}', { strict: true });
+        const lambdas = collect(ast, n => n._meta?.cppLambda);
+        assert.strictEqual(lambdas.length, 2);
+        assert.strictEqual(lambdas[0].parameters[0].id.name, 'v');
+        assert.strictEqual(lambdas[0].returnType.id.name, 'int');
+        assert.strictEqual(lambdas[0]._meta.unhandled, undefined);
+        assert.strictEqual(lambdas[1]._meta.unhandled.kind, 'cpp_lambda_capture_semantics');
+        assert.strictEqual(collect(ast, n => n.type === 'CallExpression' && n.callee?.name === 'target').length, 2);
+    });
+
+    it('preserves C-compatible struct field layout when member methods are present', () => {
+        const ast: any = parser.parsePreprocessed('struct S {int first; int second; int get(){return first;} }; struct S value={2,7};', { strict: true });
+        const value = collect(ast, n => n.type === 'VariableDeclaration' && n.id?.name === 'value')[0];
+        assert.deepStrictEqual(value.init.properties.map((property: any) => property.key.name), ['first', 'second']);
+    });
+
+    it('marks inline and qualified constructors while preserving initializer spelling', () => {
+        const ast: any = parser.parsePreprocessed('struct S {int value; S(int x):value(x){} S(); ~S(){} }; S::S(){}', { strict: true });
+        const constructors = collect(ast, n => n._meta?.isConstructor);
+        assert.strictEqual(constructors.length, 2);
+        assert.strictEqual(constructors[0]._meta.cppConstructorInitializers, ':value(x)');
+        assert.strictEqual(constructors[0]._meta.unhandled.kind, 'cpp_constructor_initializer_semantics');
+        assert.ok(!collect(ast, n => n.type === 'FunctionDefinition' && n.id?.name === '~S')[0]._meta.isConstructor);
+    });
+
     it('retains class and class-template member bodies and their scope', () => {
         const ast: any = parser.parsePreprocessed('namespace N { template<class T> class Box { public: T get(){ return T(); } template<class U> U convert(U x){ return x; } }; }', { strict: true });
         const [box] = collect(ast, n => n.type === 'ClassDefinition');
