@@ -3,7 +3,14 @@ import * as UAST from '@ant-yasa/uast-spec';
 import { version } from '../package.json';
 import { MacroEnvironment, substitute, MacroDefinition } from './macros';
 
+import { argumentsAt, prepareSyntax, SyntaxSource } from './syntax-source';
+
 type SyntaxNode = TreeSitter.Node;
+const syntaxSources = new WeakMap<TreeSitter.Tree, SyntaxSource>();
+
+function sourceOffset(node: SyntaxNode): number {
+    return syntaxSources.get(node.tree)?.offset(node.startIndex) ?? node.startIndex;
+}
 
 export interface ParseError {
     line: number;
@@ -63,14 +70,17 @@ export type NodeHandler = (
 ) => any;
 
 function toSourceLocation(node: SyntaxNode, sourcefile?: string) {
+    const mapped = syntaxSources.get(node.tree);
+    if (mapped) return { start: mapped.position(node.startIndex), end: mapped.position(node.endIndex, true), sourcefile };
+    const { startPosition, endPosition } = node;
     return {
         start: {
-            line: node.startPosition.row + 1,
-            column: node.startPosition.column + 1,
+            line: startPosition.row + 1,
+            column: startPosition.column + 1,
         },
         end: {
-            line: node.endPosition.row + 1,
-            column: node.endPosition.column + 1,
+            line: endPosition.row + 1,
+            column: endPosition.column + 1,
         },
         sourcefile,
     };
@@ -85,6 +95,11 @@ function appendNodeMeta<T>(uastNode: T, tsNode: SyntaxNode | null | undefined, s
         const loc = toSourceLocation(tsNode, sourcefile);
         (uastNode as any).loc = loc;
         (uastNode as any)._meta.loc = loc;
+        const syntax = syntaxSources.get(tsNode.tree);
+        if (syntax) {
+            const macro = syntax.macroAt(tsNode.startIndex, tsNode.endIndex);
+            if (macro) (uastNode as any)._meta.macro = macro;
+        }
         // Keep only the node kind: storing node text on every node makes the
         // UAST quadratic in file size because each ancestor repeats its children.
         (uastNode as any)._meta.origin = { type: tsNode.type };
@@ -140,7 +155,7 @@ function flattenInstructions(nodes: Array<any>): Array<any> {
 }
 
 function namedChild(node: SyntaxNode, index: number): SyntaxNode | null {
-    return node.namedChildren[index] || null;
+    return node.namedChild(index);
 }
 
 // web-tree-sitter returns a fresh wrapper object for every child access, so
@@ -231,8 +246,8 @@ function mapTypeSpecifier(node: SyntaxNode | null | undefined, opts: Record<stri
             return appendNodeMeta(st, node, sourcefile);
         }
         default:
-            if (node.namedChildren.length === 1) {
-                return mapTypeSpecifier(node.namedChildren[0], opts);
+            if (node.namedChildCount === 1) {
+                return mapTypeSpecifier(node.namedChild(0), opts);
             }
             return cIdentifier(node.text, node, sourcefile) as any;
     }
@@ -298,7 +313,7 @@ function applyDeclaratorType(base: UAST.Type, declarator: SyntaxNode | null | un
         case 'parenthesized_declarator':
         case 'abstract_parenthesized_declarator':
         case 'attributed_declarator':
-            return applyDeclaratorType(base, namedChild(declarator, 0), opts);
+            return applyDeclaratorType(base, declarator.namedChild(0), opts);
         case 'init_declarator':
             return applyDeclaratorType(base, declarator.childForFieldName('declarator'), opts);
         default:
@@ -404,7 +419,7 @@ function createDeclaration(node: SyntaxNode, opts: Record<string, any>): any {
                 pending = declarations[index];
                 members.push(pending);
             } else if (child.type === 'bitfield_clause') {
-                const widthNode = child.namedChildren[0];
+                const widthNode = child.namedChild(0);
                 const width = widthNode ? visit(widthNode, opts) : null;
                 if (pending) pending._meta.bitfield = { width };
                 else {
@@ -441,7 +456,7 @@ function arrayDims(declarator: SyntaxNode | null | undefined): number {
     while (current && !['identifier', 'field_identifier', 'type_identifier'].includes(current.type)) {
         chain.push(current);
         current = ['parenthesized_declarator', 'attributed_declarator'].includes(current.type)
-            ? namedChild(current, 0)
+            ? current.namedChild(0)
             : current.childForFieldName('declarator');
     }
     let dims = 0;
@@ -471,7 +486,7 @@ function initializerFor(valueNode: SyntaxNode, typeNode: SyntaxNode | null, dims
         let valueChild: SyntaxNode | null = child;
         if (child.type === 'initializer_pair') {
             const designator = child.childrenForFieldName('designator')[0];
-            const keyNode = designator ? namedChild(designator, 0) : null;
+            const keyNode = designator ? designator.namedChild(0) : null;
             key = keyNode ? visit(keyNode, opts) : null;
             valueChild = child.childForFieldName('value');
             if (designator?.type === 'subscript_designator' && UAST.isLiteral(key) && typeof key.value === 'number') position = key.value;
@@ -723,7 +738,7 @@ function firstNonComment(node: SyntaxNode): SyntaxNode | null {
 function preprocessorConditional(node: SyntaxNode, opts: Record<string, any>): any {
     const sourcefile = opts?.sourcefile as string | undefined;
     const env: MacroEnvironment | undefined = opts.__macroEnv;
-    const activity = opts.__macroOffset === undefined ? env?.branchActivity(node.startIndex) : undefined;
+    const activity = opts.__macroOffset === undefined ? env?.branchActivity(sourceOffset(node)) : undefined;
     const branch = activity === 'inactive' ? [] : visitStatements(unfieldedNamedChildren(node, ['name', 'condition', 'alternative']), opts);
     if (activity === 'maybe') markConditional(branch);
     const alternative = node.childForFieldName('alternative');
@@ -764,7 +779,7 @@ function expandAtUseSite(
 ): any {
     const env: MacroEnvironment | undefined = opts.__macroEnv;
     if (!env || opts.expandMacros === false || (opts.__expanding as Set<string> | undefined)?.has(name)) return plain();
-    const candidates = env.lookup(name, opts.__macroOffset ?? node.startIndex);
+    const candidates = env.lookup(name, opts.__macroOffset ?? sourceOffset(node));
     const results: any[] = [];
     let unexpanded = false;
     for (const macro of candidates) {
@@ -772,7 +787,11 @@ function expandAtUseSite(
         if (result) results.push(result);
         else unexpanded = true;
     }
-    if (unexpanded || !results.length) results.push(plain());
+    if (unexpanded || !results.length) {
+        const fallback = plain();
+        if (!fallback) return null;
+        results.push(fallback);
+    }
     if (results.length === 1) return results[0];
     const sourcefile = opts?.sourcefile as string | undefined;
     const choice = (): any => {
@@ -810,6 +829,55 @@ const UNION_SLOT = '<union>';
 /** Complete constructs worth keeping from inside a tree-sitter ERROR region. */
 const RECOVERABLE = /(_statement|_definition|^declaration|^preproc_(if|ifdef|elif|elifdef|else|def|function_def|include|call)|^ERROR|^linkage_specification)$/;
 
+/** Consume a malformed argument list only if every possible macro definition accepts it. */
+function recoverMacroCall(node: SyntaxNode, opts: Record<string, any>): any {
+    const name = node.childForFieldName('function');
+    const args = node.childForFieldName('arguments');
+    if (name?.type !== 'identifier' || !args?.hasError ||
+        node.children.some(child => child.hasError && child.id !== args.id)) return null;
+    const argText = args.text;
+    const raw = argumentsAt(argText, 0);
+    if (!raw || raw.end !== argText.length) return null;
+    const value = expandAtUseSite(name.text, node, opts,
+        def => def.params !== null && (def.variadic ? raw.args.length >= def.params.length : raw.args.length === def.params.length),
+        def => expandMacro(def, substitute(def, raw.args), node, opts),
+        () => null);
+    return value && UAST.isExpression(value) ? value : null;
+}
+
+/** Type tokens are valid macro arguments even when the unexpanded call is not a C expression. */
+function retryMacroExpression(text: string, parser: TreeSitter.Parser, opts: Record<string, any>): any {
+    if (opts.__language === 'cpp' || !text.includes('(')) return null;
+    const tree = parser.parse(`void __yasa_macro__(void) { return ${text}\n; }`);
+    if (!tree) return null;
+    try {
+        const root = tree.rootNode;
+        const statements = root.namedChild(0)?.childForFieldName('body')?.namedChildren;
+        if (root.namedChildCount !== 1 || statements?.length !== 1 || statements[0].type !== 'return_statement') return null;
+        const expression = statements[0].namedChild(0);
+        if (!expression?.hasError) return null;
+        const recovered = new Map<number, any>();
+        const pending = [root];
+        while (pending.length) {
+            const node = pending.pop()!;
+            if (!node.hasError) continue;
+            if (node.isError || node.isMissing) return null;
+            if (node.type === 'call_expression') {
+                const value = recoverMacroCall(node, opts);
+                if (value) {
+                    recovered.set(node.id, value);
+                    continue;
+                }
+            }
+            for (const child of node.children) if (child.hasError) pending.push(child);
+        }
+        // Every error in the expression must have been consumed by a fully resolved invocation.
+        return recovered.size ? visit(expression, { ...opts, __recoveredMacroCalls: { tree, recovered } }) : null;
+    } finally {
+        tree.delete();
+    }
+}
+
 /**
  * Expand a macro at its use site: re-parse the replacement text as a
  * statement, visit it with the macro marked as expanding (no self-recursion),
@@ -819,19 +887,21 @@ const RECOVERABLE = /(_statement|_definition|^declaration|^preproc_(if|ifdef|eli
 function expandMacro(macro: MacroDefinition, text: string, useSite: SyntaxNode, opts: Record<string, any>): any {
     const expanding: Set<string> = opts.__expanding ?? new Set();
     if (expanding.size >= MACRO_DEPTH_LIMIT) return null;
-    const tree = ((opts.__tsParser as TreeSitter.Parser | undefined) ?? getParser()).parse(`void __yasa_macro__(void) {\n${text}\n;}`);
+    const parser = (opts.__tsParser as TreeSitter.Parser | undefined) ?? getParser();
+    const tree = parser.parse(`void __yasa_macro__(void) {\n${text}\n;}`);
     if (!tree) return null;
     try {
         const root = tree.rootNode;
-        if (root.hasError) return null;
-        const body = root.namedChildren[0]?.childForFieldName('body');
+        const inner = { ...opts, __expanding: new Set([...expanding, macro.name]), __macroOffset: opts.__macroOffset ?? sourceOffset(useSite) };
+        const body = root.namedChild(0)?.childForFieldName('body');
         const statements = (body?.namedChildren ?? []).filter((c) =>
             c.type !== 'comment' && !(c.type === 'expression_statement' && c.namedChildCount === 0));
-        if (!statements.length) return null;
-        const inner = { ...opts, __expanding: new Set([...expanding, macro.name]), __macroOffset: opts.__macroOffset ?? useSite.startIndex };
         let result: any;
-        if (statements.length === 1 && statements[0].type === 'expression_statement') {
-            result = visit(namedChild(statements[0], 0), inner);
+        if (root.hasError) {
+            result = retryMacroExpression(text, parser, inner);
+        } else if (!statements.length) return null;
+        else if (statements.length === 1 && statements[0].type === 'expression_statement') {
+            result = visit(statements[0].namedChild(0), inner);
         } else if (statements.length === 1) {
             result = visit(statements[0], inner);
         } else {
@@ -863,10 +933,11 @@ function caseClause(node: SyntaxNode, opts: Record<string, any>): UAST.CaseClaus
 function switchCases(body: SyntaxNode, opts: Record<string, any>): UAST.CaseClause[] {
     const cases: UAST.CaseClause[] = [];
     const loose: SyntaxNode[] = [];
+    let lastBody: UAST.ScopedStatement | undefined;
     const flush = () => {
         if (!loose.length) return;
         const statements = visitStatements(loose.splice(0), opts);
-        if (cases.length) (cases[cases.length - 1].body as any).body.push(...statements);
+        if (lastBody) lastBody.body.push(...statements);
         else {
             const clause = UAST.caseClause(UAST.noop() as any, UAST.scopedStatement(statements));
             clause._meta.unreachable = true;
@@ -877,7 +948,31 @@ function switchCases(body: SyntaxNode, opts: Record<string, any>): UAST.CaseClau
         for (const child of node.namedChildren) {
             if (child.type === 'case_statement') {
                 flush();
-                cases.push(caseClause(child, opts));
+                const nested: SyntaxNode[] = [];
+                // A plain compound does not introduce a new switch. Keep its lexical
+                // body (including declarations and goto targets) at the source site.
+                const findLabels = (parent: SyntaxNode) => {
+                    for (const part of parent.namedChildren) {
+                        if (part.type === 'case_statement') {
+                            nested.push(part);
+                            findLabels(part);
+                        } else if (part.type === 'compound_statement') findLabels(part);
+                    }
+                };
+                if (opts.__language !== 'cpp') findLabels(child);
+                const owner = cases.length;
+                const labels = new Map(nested.map(item => [item.id, `<case@${item.startIndex}>`]));
+                const clause = caseClause(child, nested.length ? { ...opts, __caseLabels: { tree: child.tree, labels } } : opts);
+                lastBody = clause.body as UAST.ScopedStatement;
+                cases.push(clause);
+                for (const item of nested) {
+                    const test = item.childForFieldName('value');
+                    const jump = appendNodeMeta(UAST.noop(), item, opts.sourcefile);
+                    jump._meta.goto = labels.get(item.id);
+                    const entry = UAST.caseClause(test ? expressionOrNoop(test, opts) : null, jump);
+                    entry._meta.cCaseOwner = owner;
+                    cases.push(appendNodeMeta(entry, item, opts.sourcefile));
+                }
             } else if (/^preproc_(if|ifdef|elif|elifdef|else)$/.test(child.type)) {
                 flush();
                 collectFrom(child);
@@ -921,13 +1016,14 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
             return null;
 
         case 'identifier': {
+            const name = node.text;
             return expandAtUseSite(
-                node.text,
+                name,
                 node,
                 opts,
                 (macro) => macro.params === null && !!macro.body,
                 (macro) => expandMacro(macro, macro.body, node, opts),
-                () => cIdentifier(node.text, node, sourcefile),
+                () => cIdentifier(name, node, sourcefile),
             );
         }
 
@@ -956,7 +1052,7 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
             return expressionOrNoop(firstNonComment(node), opts);
 
         case 'expression_statement': {
-            const child = namedChild(node, 0);
+            const child = node.namedChild(0);
             if (!child) return appendNodeMeta(UAST.noop(), node, sourcefile);
             const expr = visit(child, opts);
             if (expr && UAST.isNode(expr) && !UAST.isExpression(expr)) return appendNodeMeta(expr, node, sourcefile);
@@ -1036,7 +1132,7 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
         }
 
         case 'else_clause':
-            return visit(namedChild(node, 0), opts);
+            return visit(node.namedChild(0), opts);
 
         case 'for_statement': {
             const initNode = node.childForFieldName('initializer');
@@ -1072,7 +1168,13 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
         case 'case_statement': {
             // A case label outside a switch body (e.g. after error recovery):
             // keep its statements in place.
-            const seq = UAST.sequence(visitStatements(unfieldedNamedChildren(node, ['value']), opts));
+            const statements = visitStatements(unfieldedNamedChildren(node, ['value']), opts);
+            const label = opts.__caseLabels?.tree === node.tree && opts.__caseLabels.labels.get(node.id);
+            if (label) {
+                const marker = UAST.labeledStatement(cIdentifier(label, node, sourcefile), UAST.noop());
+                statements.unshift(appendNodeMeta(marker, node, sourcefile));
+            }
+            const seq = UAST.sequence(statements);
             seq._meta.caseLabel = node.childForFieldName('value')?.text ?? 'default';
             return appendNodeMeta(seq, node, sourcefile);
         }
@@ -1185,6 +1287,8 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
         }
 
         case 'call_expression': {
+            const recovery = opts.__recoveredMacroCalls;
+            if (recovery?.tree === node.tree && recovery.recovered.has(node.id)) return recovery.recovered.get(node.id);
             const functionNode = node.childForFieldName('function');
             const plainCall = () => {
                 const callee = expressionOrNoop(functionNode, opts);
@@ -1248,7 +1352,7 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
                         return appendNodeMeta(UAST.objectProperty(appendNodeMeta(UAST.literal(index, 'number'), child, sourcefile), visit(child, opts)), child, sourcefile);
                     }
                     const designator = child.childrenForFieldName('designator')[0];
-                    const keyNode = designator?.type === 'field_designator' ? namedChild(designator, 0) : designator ? namedChild(designator, 0) : null;
+                    const keyNode = designator?.type === 'field_designator' ? designator.namedChild(0) : designator ? designator.namedChild(0) : null;
                     const key = keyNode ? visit(keyNode, opts) : appendNodeMeta(UAST.literal(index, 'number'), child, sourcefile);
                     return appendNodeMeta(UAST.objectProperty(key, visit(child.childForFieldName('value'), opts)), child, sourcefile);
                 });
@@ -1289,8 +1393,8 @@ function visitDefault(node: SyntaxNode | null | undefined, opts: Record<string, 
         }
 
         default: {
-            if (node.namedChildren.length === 1) {
-                return visit(node.namedChildren[0], opts);
+            if (node.namedChildCount === 1) {
+                return visit(node.namedChild(0), opts);
             }
             const noop = UAST.noop();
             noop._meta.unhandled = { kind: node.type };
@@ -1306,9 +1410,9 @@ function collectParseErrors(root: SyntaxNode): ParseError[] {
     for (;;) {
         const node = cursor.currentNode;
         if (descend && (node.isError || node.isMissing)) {
+            const { start } = toSourceLocation(node);
             errors.push({
-                line: node.startPosition.row + 1,
-                column: node.startPosition.column + 1,
+                ...start,
                 kind: node.isMissing ? 'missing' : 'error',
                 text: node.isMissing ? node.type : node.text.slice(0, 80),
             });
@@ -1381,8 +1485,11 @@ export function parseWithParser(tsParser: TreeSitter.Parser, content: string, op
     const env = opts.preprocessed ? undefined
         : new MacroEnvironment(source, opts.preprocessor ?? {}, opts.sourcefile);
     // Lines of branches the configuration excludes are blanked, so the tree only holds code that may be compiled.
-    const tree = tsParser.parse(env ? env.activeSource() : source);
+    const active = env ? env.activeSource(opts.language !== 'cpp') : source;
+    const syntax = env && opts.language !== 'cpp' ? prepareSyntax(active, env, opts.expandMacros !== false) : undefined;
+    const tree = tsParser.parse(syntax?.text ?? active);
     if (!tree) throw new Error('tree-sitter failed to parse the C source');
+    if (syntax) syntaxSources.set(tree, syntax);
     try {
         const root = tree.rootNode;
         const errors = root.hasError ? collectParseErrors(root) : [];
