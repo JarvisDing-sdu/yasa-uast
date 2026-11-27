@@ -80,7 +80,7 @@ interface Group {
     wellFormed: boolean;
     elseSeen: boolean;
     directives: Array<[number, number]>;
-    frame: GroupFrame;
+    frame?: GroupFrame;
 }
 
 /** A logical source line: continuation lines joined, comments removed. */
@@ -173,6 +173,96 @@ function logicalLines(text: string): Line[] {
         pieceStart = nl + 1;
     }
     return lines;
+}
+
+interface Directive {
+    start: number;
+    end: number;
+    hash: number;
+    directive: string;
+    rest: string;
+    guardDefine?: string;
+    /** Next alternative or matching #endif, for cached header directives. */
+    nextBranch?: number;
+    definition?: MacroDefinition | null;
+    conditionTokens?: string[] | null;
+}
+
+/** Any intervening nonblank line, including ordinary C code, disqualifies a guard. */
+function nextDefine(lines: Line[], index: number): string | undefined {
+    for (let i = index + 1; i < lines.length; i++) {
+        const text = lines[i].text.trim();
+        if (text) return /^#\s*define\s+([A-Za-z_]\w*)/.exec(text)?.[1];
+    }
+    return undefined;
+}
+
+function lexDirectives(uncommented: string, rawRanges: Array<[number, number]>): Directive[] {
+    const lines = logicalLines(uncommented);
+    const result: Directive[] = [];
+    let rawIndex = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const match = DIRECTIVE.exec(line.text);
+        if (!match) continue;
+        const hash = line.start + line.text.indexOf('#');
+        while (rawIndex < rawRanges.length && rawRanges[rawIndex][1] <= hash) rawIndex++;
+        if (rawIndex < rawRanges.length && hash >= rawRanges[rawIndex][0]) continue;
+        const directive = match[1] ?? '';
+        const guardDefine = directive === 'ifndef' ? nextDefine(lines, i) : undefined;
+        result.push({ start: line.start, end: line.end, hash, directive, rest: match[2] ?? '', guardDefine });
+    }
+    return result;
+}
+
+// Per worker. Only lexical results are shared: macro state, relative include
+// resolution, and the offset of an inclusion belong to each individual scan.
+const HEADER_CACHE_BUDGET = 16 * 1024 * 1024;
+const headerCache = new Map<string, { content: string; directives: Directive[]; weight: number }>();
+let headerCacheWeight = 0;
+
+function headerDirectives(file: string, content: string): Directive[] {
+    const cached = headerCache.get(file);
+    if (cached?.content === content) return cached.directives;
+    if (cached) {
+        headerCache.delete(file);
+        headerCacheWeight -= cached.weight;
+    }
+
+    const directives = lexDirectives(stripComments(content), rawStringRanges(content));
+    // A header scan only needs macro effects. Jump past a definitely inactive
+    // branch without replaying its nested directives on each inclusion.
+    const branches: number[] = [];
+    for (let i = 0; i < directives.length; i++) {
+        switch (directives[i].directive) {
+            case 'if': case 'ifdef': case 'ifndef':
+                branches.push(i);
+                break;
+            case 'elif': case 'elifdef': case 'elifndef': case 'else':
+                if (branches.length) {
+                    directives[branches[branches.length - 1]].nextBranch = i;
+                    branches[branches.length - 1] = i;
+                }
+                break;
+            case 'endif': {
+                const previous = branches.pop();
+                if (previous !== undefined) directives[previous].nextBranch = i;
+                break;
+            }
+        }
+    }
+    // Budget UTF-16 source and path storage plus an allowance per record.
+    const weight = 2 * (file.length + content.length) + 128 * (1 + directives.length);
+    if (weight <= HEADER_CACHE_BUDGET) {
+        for (const [key, entry] of headerCache) {
+            if (headerCacheWeight + weight <= HEADER_CACHE_BUDGET) break;
+            headerCache.delete(key);
+            headerCacheWeight -= entry.weight;
+        }
+        headerCache.set(file, { content, directives, weight });
+        headerCacheWeight += weight;
+    }
+    return directives;
 }
 
 function parseDefine(rest: string): MacroDefinition | null {
@@ -283,6 +373,8 @@ function applyBinary(op: string, l: number, r: number): number | undefined {
  * syntax tree only contains code that may be compiled.
  */
 export class MacroEnvironment {
+    private readonly uncommented: string;
+    private readonly rawRanges: Array<[number, number]>;
     private current = new Map<string, MacroValue>();
     private timelines = new Map<string, Array<{ offset: number; value: MacroValue }>>();
     private frames: GroupFrame[] = [];
@@ -315,7 +407,9 @@ export class MacroEnvironment {
             this.includeStack.push(sourcefile);
             this.activeIncludes.add(sourcefile);
         }
-        this.scan(source, true);
+        this.uncommented = stripComments(source);
+        this.rawRanges = rawStringRanges(source);
+        this.scan(lexDirectives(this.uncommented, this.rawRanges), true);
     }
 
     /**
@@ -325,16 +419,16 @@ export class MacroEnvironment {
      * so tree-sitter must see the selected C code without those separators.
      * Unknown groups retain their directives and their conditional metadata.
      */
-    activeSource(): string {
-        const out = this.source.split('');
+    activeSource(stripAllComments = false): string {
+        const out = (stripAllComments ? this.uncommented : this.source).split('');
         for (const [start, end] of [...this.inactiveRanges, ...this.resolvedDirectiveRanges]) {
             for (let i = start; i < end && i < out.length; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
         }
+        if (stripAllComments) return out.join('');
         // Tree-sitter can terminate a continued #define at a comment inside its
         // body. C replaces comments before macro expansion; blank them without
         // changing positions or removing physical line continuations.
-        const uncommented = stripComments(this.source);
-        const rawRanges = rawStringRanges(this.source);
+        const { uncommented, rawRanges } = this;
         let pos = 0;
         while (pos < this.source.length) {
             let end = this.source.indexOf('\n', pos);
@@ -389,6 +483,14 @@ export class MacroEnvironment {
         return result;
     }
 
+    macroNamesMatching(predicate: (def: MacroDefinition) => boolean): Set<string> {
+        const names = new Set<string>();
+        for (const [name, events] of this.timelines) {
+            if (events.some(event => event.value.some(def => def && def !== UNKNOWN && predicate(def)))) names.add(name);
+        }
+        return names;
+    }
+
     /** Whether the `#if`/`#elif`/`#else` branch whose directive starts at `offset` may be compiled. */
     branchActivity(offset: number): BranchActivity | undefined {
         return this.activity.get(offset);
@@ -420,6 +522,14 @@ export class MacroEnvironment {
         else timeline.push({ offset: at, value });
     }
 
+    // A certainly selected branch writes directly into the surrounding frame.
+    // Only an unknown condition can create multiple states to restore and join.
+    private pushFrame(): GroupFrame {
+        const frame: GroupFrame = { entry: new Map(), branch: new Map(), branches: [] };
+        this.frames.push(frame);
+        return frame;
+    }
+
     /** Restore the group's entry state at the start of a branch. */
     private startBranch(frame: GroupFrame, offset: number): void {
         for (const [name, entry] of frame.entry) {
@@ -432,15 +542,25 @@ export class MacroEnvironment {
         frame.branch = new Map();
     }
 
-    /**
-     * @param text - file content
-     * @param main - the translation unit itself (records branch activity and excluded lines)
-     */
-    private scan(text: string, main: boolean): void {
-        const lines = logicalLines(stripComments(text));
-        const rawRanges = rawStringRanges(text);
+    private mergeGroup(group: Group, offset: number): void {
+        const { frame } = group;
+        if (!frame) return;
+        if (group.live) frame.branches.push(frame.branch);
+        this.frames.pop();
+        const outer = this.frames[this.frames.length - 1];
+        for (const [name, entry] of frame.entry) {
+            // Changes inside a nested group must retain the enclosing branch's entry value.
+            if (outer && !outer.entry.has(name)) outer.entry.set(name, entry);
+            const outcomes = frame.branches.map(branch => branch.get(name) ?? entry);
+            if (!group.decided) outcomes.push(entry);
+            this.set(name, union(outcomes, this.unseen), offset);
+        }
+    }
+
+    /** Only the translation unit itself records branch activity and excluded lines. */
+    private scan(directives: Directive[], main: boolean): void {
         const groups: Group[] = [];
-        const live = () => groups.every((g) => g.live);
+        const live = () => !groups.length || groups[groups.length - 1].live;
         let inactiveFrom: number | null = null;
         const updateInactive = (offset: number) => {
             if (!main) return;
@@ -450,39 +570,34 @@ export class MacroEnvironment {
                 inactiveFrom = null;
             }
         };
-        for (let index = 0; index < lines.length; index++) {
-            const line = lines[index];
-            const m = DIRECTIVE.exec(line.text);
-            if (!m) continue;
-            const directive = m[1] ?? '';
-            const rest = m[2] ?? '';
-            const hash = line.start + line.text.indexOf('#');
-            if (rawRanges.some(([start, end]) => hash >= start && hash < end)) continue;
+        for (let i = 0; i < directives.length; i++) {
+            const line = directives[i];
+            const { directive, rest, hash } = line;
             switch (directive) {
                 case 'if':
                 case 'ifdef':
                 case 'ifndef': {
                     const parentLive = live();
-                    const frame: GroupFrame = { entry: new Map(), branch: new Map(), branches: [] };
                     let truth: boolean | undefined = false;
                     if (parentLive) {
-                        if (directive === 'if') truth = this.truth(rest);
+                        if (directive === 'if') truth = this.truth(line);
                         else {
                             const name = rest.trim().split(/\s+/)[0] ?? '';
-                            truth = directive === 'ifndef' && this.isIncludeGuard(name, lines, index) ? true : this.definedTruth(name, directive === 'ifndef');
+                            truth = directive === 'ifndef' && name === line.guardDefine && !this.current.has(name) ? true : this.definedTruth(name, directive === 'ifndef');
                         }
                     }
                     const group: Group = {
                         parentLive, live: parentLive && truth !== false, decided: truth === true,
                         uncertain: truth === undefined,
-                        wellFormed: directive === 'if' ? !!rest.trim() : /^\s*[A-Za-z_]\w*\s*$/.test(rest),
-                        elseSeen: false, directives: [[line.start, line.end]], frame,
+                        wellFormed: !main || (directive === 'if' ? !!rest.trim() : /^\s*[A-Za-z_]\w*\s*$/.test(rest)),
+                        elseSeen: false, directives: main ? [[line.start, line.end]] : [],
                     };
                     if (parentLive) {
-                        this.frames.push(frame);
+                        if (truth === undefined) group.frame = this.pushFrame();
                         this.recordActivity(main, hash, group.live ? (truth === true ? 'active' : 'maybe') : 'inactive');
                     }
                     groups.push(group);
+                    if (!group.live && line.nextBranch !== undefined) i = line.nextBranch - 1;
                     updateInactive(line.end);
                     break;
                 }
@@ -492,26 +607,30 @@ export class MacroEnvironment {
                 case 'else': {
                     const group = groups[groups.length - 1];
                     if (!group) break;
-                    group.directives.push([line.start, line.end]);
-                    if (group.elseSeen) group.wellFormed = false;
-                    if (directive === 'else') {
-                        group.elseSeen = true;
-                        if (rest.trim()) group.wellFormed = false;
-                    } else if (directive === 'elif' ? !rest.trim() : !/^\s*[A-Za-z_]\w*\s*$/.test(rest)) {
-                        group.wellFormed = false;
+                    if (main) {
+                        group.directives.push([line.start, line.end]);
+                        if (group.elseSeen) group.wellFormed = false;
+                        if (directive === 'else') {
+                            group.elseSeen = true;
+                            if (rest.trim()) group.wellFormed = false;
+                        } else if (directive === 'elif' ? !rest.trim() : !/^\s*[A-Za-z_]\w*\s*$/.test(rest)) {
+                            group.wellFormed = false;
+                        }
                     }
                     if (group.parentLive) {
-                        if (group.live) group.frame.branches.push(group.frame.branch);
+                        if (group.live && group.frame) group.frame.branches.push(group.frame.branch);
                         let truth: boolean | undefined = true;
                         if (group.decided) truth = false;
-                        else if (directive === 'elif') truth = this.truth(rest);
+                        else if (directive === 'elif') truth = this.truth(line);
                         else if (directive !== 'else') truth = this.definedTruth(rest.trim().split(/\s+/)[0] ?? '', directive === 'elifndef');
                         group.uncertain = group.uncertain || truth === undefined;
                         group.live = truth !== false;
                         if (truth === true) group.decided = true;
                         this.recordActivity(main, hash, group.live ? (truth === true ? 'active' : 'maybe') : 'inactive');
-                        if (group.live) this.startBranch(group.frame, line.start);
+                        if (group.live && group.frame) this.startBranch(group.frame, line.start);
+                        else if (truth === undefined) group.frame = this.pushFrame();
                     }
+                    if (!group.live && line.nextBranch !== undefined) i = line.nextBranch - 1;
                     // The directive line itself stays; the branch body follows it.
                     if (main && inactiveFrom !== null) {
                         this.inactiveRanges.push([inactiveFrom, line.start]);
@@ -522,9 +641,9 @@ export class MacroEnvironment {
                 }
                 case 'endif': {
                     const group = groups.pop();
-                    if (group) {
+                    if (group && main) {
                         group.directives.push([line.start, line.end]);
-                        if (main && group.wellFormed && !rest.trim() && !group.uncertain) {
+                        if (group.wellFormed && !rest.trim() && !group.uncertain) {
                             for (const range of group.directives) this.resolvedDirectiveRanges.push(range);
                         }
                     }
@@ -532,25 +651,20 @@ export class MacroEnvironment {
                         this.inactiveRanges.push([inactiveFrom, line.start]);
                         inactiveFrom = null;
                     }
-                    if (group?.parentLive) {
-                        if (group.live) group.frame.branches.push(group.frame.branch);
-                        this.frames.pop();
-                        const outer = this.frames[this.frames.length - 1];
-                        for (const [name, entry] of group.frame.entry) {
-                            // Unchanged in the enclosing group so far, so its value there is the one before this group.
-                            if (outer && !outer.entry.has(name)) outer.entry.set(name, entry);
-                            const outcomes = group.frame.branches.map((b) => (b.has(name) ? b.get(name) : entry));
-                            if (!group.decided) outcomes.push(entry);
-                            this.set(name, union(outcomes, this.unseen), line.end);
-                        }
-                    }
+                    if (group) this.mergeGroup(group, line.end);
                     updateInactive(line.end);
                     break;
                 }
                 case 'define':
                     if (live()) {
-                        const def = parseDefine(rest);
-                        if (def) this.set(def.name, [def], line.end);
+                        if (line.definition === undefined) line.definition = parseDefine(rest);
+                        const def = line.definition;
+                        if (def) {
+                            // Public lookup results and branch unions preserve the identity
+                            // of each definition event, even across repeated inclusions.
+                            const value = main ? def : { ...def, params: def.params?.slice() ?? null };
+                            this.set(def.name, [value], line.end);
+                        }
                     }
                     break;
                 case 'undef':
@@ -573,7 +687,12 @@ export class MacroEnvironment {
                     break;
             }
         }
-        if (main && inactiveFrom !== null) this.inactiveRanges.push([inactiveFrom, text.length]);
+        if (main && inactiveFrom !== null) this.inactiveRanges.push([inactiveFrom, this.source.length]);
+        // An incomplete conditional in a header cannot extend into its caller.
+        // Join any possible definitions at the include site before resuming it.
+        if (!main) {
+            for (let i = groups.length - 1; i >= 0; i--) this.mergeGroup(groups[i], this.includeOffset!);
+        }
     }
 
     private recordActivity(main: boolean, offset: number, activity: BranchActivity): void {
@@ -599,25 +718,13 @@ export class MacroEnvironment {
             this.includes.push(header.file);
         }
         try {
-            this.scan(header.content, false);
+            this.scan(headerDirectives(header.file, header.content), false);
         } finally {
             this.includeStack.pop();
             this.activeIncludes.delete(header.file);
             this.includeOffset = outerOffset;
             this.definiteIncludeContext = outerDefinite;
         }
-    }
-
-    /** `#ifndef H` whose next directive is `#define H`: the header's own guard. */
-    private isIncludeGuard(name: string, lines: Line[], index: number): boolean {
-        if (!name || this.current.has(name)) return false;
-        for (let i = index + 1; i < lines.length; i++) {
-            const text = lines[i].text.trim();
-            if (!text) continue;
-            const m = /^#\s*define\s+([A-Za-z_]\w*)/.exec(text);
-            return !!m && m[1] === name;
-        }
-        return false;
     }
 
     private definedTruth(name: string, negated: boolean): boolean | undefined {
@@ -633,15 +740,15 @@ export class MacroEnvironment {
     }
 
     /** Three-valued truth of an `#if`/`#elif` expression. */
-    private truth(expression: string): boolean | undefined {
-        const value = this.evaluate(expression, 0);
+    private truth(line: Directive): boolean | undefined {
+        if (line.conditionTokens === undefined) line.conditionTokens = tokenize(line.rest);
+        const value = this.evaluate(line.conditionTokens, 0);
         return value === undefined ? undefined : value !== 0;
     }
 
     /** Value of a preprocessor expression, or undefined when the configuration does not decide it. */
-    private evaluate(expression: string, depth: number): number | undefined {
+    private evaluate(tokens: string[] | null, depth: number): number | undefined {
         if (depth > 16) return undefined;
-        const tokens = tokenize(expression);
         if (!tokens || !tokens.length) return undefined;
         let pos = 0;
         let failed = false;
@@ -714,7 +821,8 @@ export class MacroEnvironment {
                     if (args.length === 1 && !args[0].length && def.params.length === 0) args.length = 0;
                     if (args.length < def.params.length || (!def.variadic && args.length !== def.params.length)) return undefined;
                     const replacement = substitute(def, args.map((arg) => arg.join(' ')));
-                    return isPrimaryReplacement(tokenize(replacement)) ? this.evaluate(replacement, depth + 1) : undefined;
+                    const replacementTokens = tokenize(replacement);
+                    return isPrimaryReplacement(replacementTokens) ? this.evaluate(replacementTokens, depth + 1) : undefined;
                 }
                 const value = this.value(t);
                 if (value.length !== 1 || value[0] === UNKNOWN) return undefined;
@@ -723,8 +831,9 @@ export class MacroEnvironment {
                 // Macro expansion is textual, not an implicit pair of parentheses.
                 // Evaluating `#define X 1 + 2` as a primary in `3 * X` would
                 // select the wrong branch. Keep both branches when in doubt.
-                if (def.params !== null || !isPrimaryReplacement(tokenize(def.body))) return undefined;
-                return this.evaluate(def.body, depth + 1);
+                if (def.params !== null) return undefined;
+                const bodyTokens = tokenize(def.body);
+                return isPrimaryReplacement(bodyTokens) ? this.evaluate(bodyTokens, depth + 1) : undefined;
             }
             failed = true;
             return undefined;

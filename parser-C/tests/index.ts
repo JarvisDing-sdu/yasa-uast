@@ -207,6 +207,83 @@ describe('parser-C', () => {
             assert.ok(preprocessed.body.some((n: any) => n.type === 'FunctionDefinition' && n.id.name === 'valid'));
         });
 
+        it('keeps declarations and functions after empty annotation and directive macros', () => {
+            const code = [
+                '#define API /* an exported declaration',
+                '               uses the default visibility */',
+                '#define S static',
+                '#define IGNORE(x)   ',
+                'typedef int Number;',
+                'API Number *get(Number *value);',
+                'S Number *get(Number *value) {',
+                '  IGNORE(value); return value;',
+                '}',
+            ].join('\r\n');
+            const ast = unit(code, { strict: true });
+            assert.ok(ast.body.some((n: any) => n._meta.prototype === 'get'));
+            const fn = ast.body.find((n: any) => n.type === 'FunctionDefinition');
+            assert.deepStrictEqual([fn.id.name, fn.modifiers, fn.loc.start.line, fn.loc.end.line], ['get', ['static'], 7, 9]);
+            assert.strictEqual(collect(fn, n => n.type === 'ReturnStatement')[0].argument.name, 'value');
+            assert.ok(!ast.body.some((n: any) => n.type.endsWith('Statement')));
+        });
+
+        it('keeps function names after empty header annotations in pointer and scalar declarators', () => {
+            const code = [
+                '#include "attributes.h"',
+                'typedef unsigned Word;',
+                'const Word FAR * CALL table(void) { return 0; }',
+                'const char * CALL version(void) { return "1"; }',
+                'Word CALL flags(void) { return 1; }',
+            ].join('\n');
+            const ast = unit(code, { strict: true, preprocessor: {
+                resolveInclude: () => ({ file: 'attributes.h', content: '#define FAR\n#define CALL\n' }),
+            } });
+            assert.deepStrictEqual(collect(ast, n => n.type === 'FunctionDefinition').map(fn =>
+                [fn.id.name, fn.id.loc.start.line, fn.id.loc.start.column, fn.returnType.type]),
+            [
+                ['table', 3, 23, 'PointerType'],
+                ['version', 4, 19, 'PointerType'],
+                ['flags', 5, 11, 'Identifier'],
+            ]);
+        });
+
+        it('keeps calls from nested block macros inside their function at the original sites', () => {
+            const code = [
+                '#define INNER(x) { hit(x); }',
+                '#define OUTER(x) { INNER(x) finish(); }',
+                '#define IGNORE(x)',
+                '#define TRY IGNORE(unused());',
+                '#define EXCEPT(x) IGNORE(x);',
+                'void run(int x) {',
+                '  OUTER(',
+                '      x) next();',
+                '  TRY { work(); } EXCEPT(failed();)',
+                '  last();',
+                '}',
+            ].join('\n');
+            const ast = unit(code, { strict: true });
+            const fn = ast.body.find((n: any) => n.type === 'FunctionDefinition');
+            const calls = collect(fn, n => n.type === 'CallExpression');
+            assert.deepStrictEqual(calls.map(n => [n.callee.name, n.loc.start.line, n.loc.end.line]), [
+                ['hit', 7, 8], ['finish', 7, 8], ['next', 8, 8], ['work', 9, 9], ['last', 10, 10],
+            ]);
+            assert.strictEqual(calls[2].loc.start.column, 10);
+            assert.ok(!ast.body.some((n: any) => n.type.endsWith('Statement')));
+        });
+
+        it('preserves raw spellings in stringified and pasted macro arguments', () => {
+            const code = [
+                '#define S static',
+                '#define NAME(x) #x',
+                '#define PREFIX(x) x ## _value',
+                'void f(void) { save(NAME(S), PREFIX(S)); }',
+            ].join('\n');
+            const fn = unit(code, { strict: true }).body.find((n: any) => n.type === 'FunctionDefinition');
+            const args = collect(fn, n => n.type === 'CallExpression')[0].arguments;
+            assert.strictEqual(args[0].value, 'S');
+            assert.strictEqual(args[1].name, 'S_value');
+        });
+
         it('records source locations', () => {
             const decl = body('\n  int value = 1;')[0];
             assert.deepStrictEqual(decl.id.loc.start, { line: 2, column: 7 });
@@ -503,6 +580,38 @@ void f(char *data) { EXEC("/bin/sh", CMD_ARG, 0); RUN(data); LOG("%s", data, 1);
             assert.strictEqual(run.loc.start.line, 5);
         });
 
+        it('expands nested macros with type operands at the original call site', () => {
+            const code = `#define WRAP(x) put(MAKE(const unsigned int *, (x)), x)
+#ifdef FEATURE
+#define MAKE(T,x) first(sizeof(T), x)
+#else
+#define MAKE(T,x) second(sizeof(T), x)
+#endif
+void f(int x) { WRAP(x); }
+#undef MAKE
+#define MAKE(T,x) last(sizeof(T), x)
+void g(int x) { WRAP(x); }`;
+            const [f, g] = collect(unit(code), n => n.type === 'FunctionDefinition');
+            const call = f.body.body[0].expression;
+            assert.strictEqual(call.callee.name, 'put');
+            const choice = call.arguments[0];
+            assert.strictEqual(choice.test._meta.preprocessorChoice, 'MAKE');
+            assert.deepStrictEqual([choice.consequent.callee.name, choice.alternative.callee.name], ['first', 'second']);
+            for (const child of collect(call, n => n.type === 'CallExpression')) {
+                assert.deepStrictEqual(child.loc.start, { line: 7, column: 17 });
+                assert.deepStrictEqual(child.loc.end, { line: 7, column: 24 });
+            }
+            assert.strictEqual(g.body.body[0].expression.arguments[0].callee.name, 'last');
+        });
+
+        it('keeps the original macro call for errors outside nested macro arguments', () => {
+            const stmts = fnBody(`#define MAKE(T,x) get(sizeof(T), x)
+#define BROKEN(x) put(MAKE(unsigned int, x), 2 + )
+#define BAD_ARITY(x) put(MAKE(unsigned int, x, 1), x)
+void f(int x) { BROKEN(x); BAD_ARITY(x); }`);
+            assert.deepStrictEqual(stmts.map((s: any) => s.expression.callee.name), ['BROKEN', 'BAD_ARITY']);
+        });
+
         it('prefers portable macro definitions over Windows-only ones', () => {
             const stmts = fnBody(`#ifdef _WIN32
 #define EXECL _execl
@@ -558,6 +667,80 @@ void f(char *a, char *b, char *buf) { D("%s %s", a, b); LOG(buf); LOG("%s", buf)
     });
 
     describe('preprocessor semantics', () => {
+        it('reevaluates repeated header directives under the macros at each include', () => {
+            const header = [
+                '#if /* mode */ MODE == \\',
+                ' 1',
+                '#define PICK fast',
+                '#else',
+                '#define PICK slow',
+                '#endif',
+            ].join('\r\n');
+            const source = [
+                '#include "mode.h"',
+                'void first(void) { PICK(); }',
+                '#undef MODE',
+                '#define MODE 1',
+                '#include "mode.h"',
+                'void second(void) { PICK(); }',
+            ].join('\n');
+            for (const mode of ['0', '1']) {
+                const ast = unit(source, { preprocessor: {
+                    defines: { MODE: mode },
+                    resolveInclude: () => ({ file: '/mode.h', content: header }),
+                } });
+                const callees = collect(ast, n => n.type === 'CallExpression').map(n => n.callee.name);
+                assert.deepStrictEqual(callees, [mode === '0' ? 'slow' : 'fast', 'fast']);
+            }
+        });
+
+        it('uses replacement header contents even when path and length stay the same', () => {
+            const source = '#include "edited.h"\nint f(void) { return VALUE; }';
+            for (const value of [17, 24, 17]) {
+                const ast = unit(source, { preprocessor: {
+                    resolveInclude: () => ({ file: '/edited.h', content: '#define VALUE ' + value + '\n' }),
+                } });
+                assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement')[0].argument.value, value);
+            }
+        });
+
+        it('resolves nested includes with the current translation unit search path', () => {
+            const code = '#include "settings.h"\nint f(void) { return VALUE; }';
+            for (const arch of ['arm', 'x86']) {
+                const ast = unit(code, { preprocessor: {
+                    resolveInclude: (name: string, from: string, angled: boolean) => {
+                        if (name === 'settings.h') return { file: '/shared/settings.h', content: '#include <arch.h>\n' };
+                        assert.deepStrictEqual([name, from, angled], ['arch.h', '/shared/settings.h', true]);
+                        return { file: '/' + arch + '/arch.h', content: '#define VALUE ' + (arch === 'arm' ? 1 : 2) };
+                    },
+                } });
+                assert.deepStrictEqual(ast._meta.includes, ['/shared/settings.h', '/' + arch + '/arch.h']);
+                assert.strictEqual(collect(ast, n => n.type === 'ReturnStatement')[0].argument.value, arch === 'arm' ? 1 : 2);
+            }
+        });
+
+        it('keeps mutable header macro definitions local to each translation unit', () => {
+            const code = '#include "fn.h"\n';
+            const config = { resolveInclude: () => ({ file: '/fn.h', content: '#define FN(x) x\n' }) };
+            const first = new MacroEnvironment(code, config, '/first.c').lookup('FN', code.length)[0]!;
+            first.body = 'other';
+            first.params![0] = 'other';
+            const next = new MacroEnvironment(code, config, '/next.c').lookup('FN', code.length)[0]!;
+            assert.strictEqual(next.body, 'x');
+            assert.deepStrictEqual(next.params, ['x']);
+        });
+
+        it('distinguishes an include guard from an ifndef with code before its define', () => {
+            const code = '#include "guard-lookalike.h"\n';
+            const config = { resolveInclude: () => ({
+                file: '/guard-lookalike.h',
+                content: '#ifndef FEATURE\nint declaration;\n#define FEATURE 1\n#endif\n',
+            }) };
+            const states = new MacroEnvironment(code, config, '/source.c').lookup('FEATURE', code.length);
+            assert.ok(states.includes(null));
+            assert.ok(states.some(def => def?.body === '1'));
+        });
+
         it('respects a previously defined header guard on repeated includes', () => {
             const code = '#include "guard.h"\n#undef VALUE\n#include "guard.h"\nint f(void) { return VALUE; }';
             const header = '#ifndef GUARD_H\n#define GUARD_H\n#define VALUE 7\n#endif\n';
@@ -726,6 +909,34 @@ void g(void) { sink(IN()); }`;
             const fns = u.body.filter((n: any) => n.type === 'FunctionDefinition');
             assert.deepStrictEqual(fns.map((f: any) => f.body.body[0].expression.arguments[0].callee.name), ['IN', 'fromHeader', 'local']);
             assert.deepStrictEqual(u._meta.includes, ['/inc/input.h']);
+        });
+
+        it('merges a header choice reached through elif and replays its guard after undef', () => {
+            const header = [
+                '#ifndef H', '#define H', '#if 0', '#if MAYBE', '#include "dead.h"', '#endif',
+                '#elif MAYBE', '#if 1', '#define V A', '#endif', '#else', '#define V B', '#endif', '#endif',
+            ].join('\n');
+            const code = '#define V initial\n#include "h"\n#undef V\n#include "h"\n#undef H\n#include "h"\n';
+            const visited: string[] = [];
+            const env = new MacroEnvironment(code, { resolveInclude(name) {
+                visited.push(name);
+                return { file: name, content: header };
+            } }, 't.c');
+            const bodies = (at: number) => env.lookup('V', at).map(def => def?.body ?? null);
+            assert.deepStrictEqual(visited, ['h', 'h', 'h']);
+            assert.deepStrictEqual(bodies(code.indexOf('#include')), ['initial']);
+            assert.deepStrictEqual(bodies(code.indexOf('#undef V')), ['A', 'B']);
+            assert.deepStrictEqual(bodies(code.indexOf('#undef H')), [null]);
+            assert.deepStrictEqual(bodies(code.length), ['A', 'B']);
+        });
+
+        it('ends an unfinished header conditional before the enclosing file resumes', () => {
+            const code = '#ifdef OUTER\n#include "broken.h"\n#else\n#define LOCAL other\n#endif\n';
+            const header = '#if 1\n#ifdef FEATURE\n#define LOCAL value\n';
+            const env = new MacroEnvironment(code, {
+                resolveInclude: () => ({ file: 'broken.h', content: header }),
+            }, 't.c');
+            assert.deepStrictEqual(env.lookup('LOCAL', code.length).map(def => def?.body ?? null), ['value', null, 'other']);
         });
 
         it('keeps a function whose active else braces cross conditional directives', () => {
